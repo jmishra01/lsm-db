@@ -19,11 +19,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::compaction::{
-    l0_needs_compaction, merge_entries, next_ss_table_path, write_merged
+    l0_needs_compaction, merge_entries, next_sstable_path, write_merged
 };
 
-use crate::mem_table::MemTable;
-use crate::ss_table::SSTable;
+use crate::memtable::{MemTable};
+use crate::sstable::SSTable;
 use crate::wal::{Wal, WalRecord};
 
 /// Flush memtable when it exceeds this size.
@@ -45,10 +45,10 @@ pub struct LsmEngine {
 
 #[derive(Clone, Debug)]
 pub struct Stats {
-    pub mem_table_size_bytes: usize,
+    pub memtable_size_bytes: usize,
     pub immutable_count: usize,
     pub level_file_counts: Vec<usize>,
-    pub total_ss_table_files: usize,
+    pub total_sstable_files: usize,
 }
 
 // -- Engine impl
@@ -145,7 +145,7 @@ impl LsmEngine {
 
         // 3. SSTables level by level(L0 = newest)
         for level_files in &self.levels {
-            // Within L0 check all filess; within L1+ onlu one file can match
+            // Within L0 check all files; within L1+ only one file can match
             for sst in level_files.iter().rev() {
                 match sst.get(key)? {
                     Some(Some(v)) => return Ok(Some(v)),
@@ -221,7 +221,7 @@ impl LsmEngine {
             let budget = crate::compaction::L1_BASE_BYTES * (crate::compaction::SIZE_RATIO as u64).pow(level as u32 - 1);
             let total: u64 = self.levels[level]
                 .iter()
-                .map(|s| std::fs::metadata(&s.path).map(|m| m.len()).unwrap_or(0))
+                .map(|s| fs::metadata(&s.path).map(|m| m.len()).unwrap_or(0))
                 .sum();
 
             if total > budget && !self.levels[level].is_empty() {
@@ -237,7 +237,7 @@ impl LsmEngine {
         std::mem::swap(&mut self.mem, &mut flushing);
 
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        let path = next_ss_table_path(&self.dir, 0, seq);
+        let path = next_sstable_path(&self.dir, 0, seq);
         let sst = SSTable::write_from_memtable(&path, &flushing, 0)?;
         self.levels[0].push(sst);
 
@@ -279,7 +279,7 @@ impl LsmEngine {
 
         if !merged.is_empty() {
             let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-            let path = next_ss_table_path(&self.dir, 0, seq);
+            let path = next_sstable_path(&self.dir, 0, seq);
             let sst = write_merged(path, merged, 1)?;
             self.levels[1].push(sst);
         }
@@ -311,7 +311,7 @@ impl LsmEngine {
 
         if !merged.is_empty() {
             let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-            let path = next_ss_table_path(&self.dir, (level + 1) as u32, seq);
+            let path = next_sstable_path(&self.dir, (level + 1) as u32, seq);
             let sst = write_merged(path, merged, (level + 1) as u32)?;
             self.levels[level + 1].push(sst);
         }
@@ -323,10 +323,10 @@ impl LsmEngine {
         let level_file_counts = self.levels.iter().map(|l| l.len()).collect::<Vec<usize>>();
         let total_sstable_files: usize = level_file_counts.iter().sum();
         Stats {
-            mem_table_size_bytes: self.mem.size_bytes,
+            memtable_size_bytes: self.mem.size_bytes,
             immutable_count: self.imm.len(),
             level_file_counts,
-            total_ss_table_files: total_sstable_files,
+            total_sstable_files,
         }
     }
 }

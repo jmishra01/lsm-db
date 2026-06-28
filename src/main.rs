@@ -82,7 +82,7 @@ fn main() -> std::io::Result<()> {
 
         println!(" Overwrote first 500 keys");
         let s = db.stats();
-        println!(" memtable={} bytes files/level={:?}", s.mem_table_size_bytes, s.level_file_counts);
+        println!(" memtable={} bytes files/level={:?}", s.memtable_size_bytes, s.level_file_counts);
         let v0 = db.get("sensor:000000")?.map(|v| String::from_utf8(v).unwrap()).unwrap_or_default();
         let v999 = db.get("sensor:000999")?.map(|v| String::from_utf8(v).unwrap()).unwrap_or_default();
         println!(" sensor:000000 -> {}", v0);
@@ -111,9 +111,9 @@ fn main() -> std::io::Result<()> {
     {
         let db = LsmEngine::open(dir)?;
         let s = db.stats();
-        println!(" memtable     : {} bytes", s.mem_table_size_bytes);
+        println!(" memtable     : {} bytes", s.memtable_size_bytes);
         println!(" immutable    : {}", s.immutable_count);
-        println!(" total sst    : {} file(s)", s.total_ss_table_files);
+        println!(" total sst    : {} file(s)", s.total_sstable_files);
         for (i, cnt) in s.level_file_counts.iter().enumerate() {
             if *cnt > 0 {
                 println!("  L{}     : {} file(s)", i, cnt);

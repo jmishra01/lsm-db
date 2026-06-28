@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::mem_table::MemTable;
-use crate::ss_table::SSTable;
+use crate::memtable::MemTable;
+use crate::sstable::SSTable;
 
 pub const L0_MAX_FILES: usize = 4;
 pub const SIZE_RATIO: usize = 10;
@@ -67,6 +67,6 @@ pub fn l0_needs_compaction(l0: &[SSTable]) -> bool {
 }
 
 /// Generate a fresh SSTable file name
-pub fn next_ss_table_path(dir: &Path, level: u32, seq:u64) -> PathBuf {
+pub fn next_sstable_path(dir: &Path, level: u32, seq:u64) -> PathBuf {
     dir.join(format!("L{level}_{seq:08}.sst"))
 }

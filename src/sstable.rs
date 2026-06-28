@@ -31,7 +31,7 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{ Path, PathBuf};
 
 use crate::bloom::BloomFilter;
-use crate::mem_table::MemTable;
+use crate::memtable::MemTable;
 
 const MAGIC: u64 = 0xDEAD_BEEF_CAFE_BABE;
 const FOOTER_SIZE: usize = 40;
