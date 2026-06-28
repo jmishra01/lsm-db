@@ -403,5 +403,31 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    // ── Section 15: HTTP API (#11) ──────────────────────────────────────────
+    {
+        println!("\n=== Section 15: HTTP API ===");
+
+        let dir = std::env::temp_dir().join(format!("lsmdb-http-demo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let shared = SharedLsmEngine::open(&dir)?;
+        shared.put("http:hello", "world")?;
+        shared.put("http:foo",   "bar")?;
+
+        // Build the router — in production you'd do:
+        //   let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+        //   axum::serve(listener, app).await?;
+        let _app = lsmdb::http_api::make_router(shared.clone());
+        println!(" Router created with routes:");
+        println!("   GET    /key/:key          -> point lookup");
+        println!("   PUT    /key/:key          -> insert  (body = value)");
+        println!("   DELETE /key/:key          -> delete");
+        println!("   GET    /scan?from=&to=    -> range scan");
+        println!("   GET    /prefix/:prefix    -> prefix scan");
+        println!("   GET    /snapshot          -> consistent snapshot (JSON)");
+        println!("   GET    /stats             -> engine stats (JSON)");
+        println!(" To start:  axum::serve(TcpListener::bind(addr).await?, app).await?");
+        println!(" ✓ HTTP API compiled and router constructed.");
+    }
+
     Ok(())
 }

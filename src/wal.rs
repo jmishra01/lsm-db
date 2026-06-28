@@ -153,6 +153,109 @@ impl Wal {
     }
 }
 
+impl WalRecord {
+    /// Decode a single record from a raw frame (payload WITHOUT CRC).
+    /// Used by the replication client to deserialize frames from the wire.
+    pub fn decode_frame(frame: &[u8]) -> io::Result<WalRecord> {
+        if frame.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "empty frame"));
+        }
+        let tag = frame[0];
+        let mut pos = 1usize;
+
+        let key_len = u32::from_be_bytes(frame[pos..pos+4].try_into().unwrap()) as usize;
+        pos += 4;
+        let key = frame[pos..pos+key_len].to_vec();
+        pos += key_len;
+
+        let seq = u64::from_le_bytes(frame[pos..pos+8].try_into().unwrap());
+        pos += 8;
+
+        if tag == 0x00 {
+            let val_len = u32::from_be_bytes(frame[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            let value = frame[pos..pos+val_len].to_vec();
+            Ok(WalRecord::Put { key, seq, value })
+        } else {
+            Ok(WalRecord::Delete { key, seq })
+        }
+    }
+
+    /// Read records from `reader` starting at its current position.
+    /// Returns each record paired with the raw bytes (payload + CRC) for
+    /// forwarding to replication followers.
+    pub fn recover_from_reader_with_raw(
+        reader: &mut impl Read,
+    ) -> io::Result<Vec<(WalRecord, Vec<u8>)>> {
+        let mut out = Vec::new();
+
+        loop {
+            let mut tag = [0u8; 1];
+            match reader.read_exact(&mut tag) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+
+            let key = match read_bytes(reader) {
+                Ok(k) => k,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            };
+
+            let seq = match read_u64_le(reader) {
+                Ok(s) => s,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            };
+
+            let value = if tag[0] == 0 {
+                match read_bytes(reader) {
+                    Ok(v) => Some(v),
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                }
+            } else {
+                None
+            };
+
+            let mut crc_buf = [0u8; 4];
+            match reader.read_exact(&mut crc_buf) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+            let stored_crc = u32::from_le_bytes(crc_buf);
+
+            // Rebuild payload for CRC check AND raw forwarding.
+            let mut payload = vec![tag[0]];
+            payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
+            payload.extend_from_slice(&key);
+            payload.extend_from_slice(&seq.to_le_bytes());
+            if let Some(ref v) = value {
+                payload.extend_from_slice(&(v.len() as u32).to_be_bytes());
+                payload.extend_from_slice(v);
+            }
+
+            if stored_crc != crc32fast::hash(&payload) {
+                break; // corrupt — stop
+            }
+
+            let record = match value {
+                Some(ref v) => WalRecord::Put { key: key.clone(), seq, value: v.clone() },
+                None        => WalRecord::Delete { key: key.clone(), seq },
+            };
+
+            // raw = payload + crc (what the server sends as a frame)
+            let mut raw = payload;
+            raw.extend_from_slice(&stored_crc.to_le_bytes());
+            out.push((record, raw));
+        }
+
+        Ok(out)
+    }
+}
+
 fn read_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;

@@ -28,7 +28,11 @@
 8. [File Layout on Disk](#8-file-layout-on-disk)
 9. [Key Trade-offs and Limitations](#9-key-trade-offs-and-limitations)
 10. [Running the Demo](#10-running-the-demo)
-11. [Further Reading](#11-further-reading)
+11. [Higher-Level Features](#11-higher-level-features)
+    - [#11 HTTP API](#11-http-api)
+    - [#12 Replication](#12-replication)
+    - [#13 Benchmark Suite](#13-benchmark-suite)
+12. [Further Reading](#12-further-reading)
 
 ---
 
@@ -808,10 +812,148 @@ The demo exercises all 14 major features:
 | 12 | **Iterator / Cursor API** — merge-heap over MemTable + SSTables |
 | 13 | **Prefix scans** — hierarchical key spaces |
 | 14 | **Snapshots + WriteBatch** — MVCC with seq numbers |
+| 15 | **HTTP API** — axum router wrapping `SharedLsmEngine` |
 
 ---
 
-## 11. Further Reading
+## 11. Higher-Level Features
+
+### #11 HTTP API
+
+**File:** `src/http_api.rs`
+
+Wraps `SharedLsmEngine` in an [axum](https://github.com/tokio-rs/axum) REST server so the database is accessible over HTTP — a mini-Redis or mini-etcd.
+
+#### Why expose it over HTTP?
+
+- Decouples the storage engine from the application language — any client that speaks HTTP can read and write.
+- Makes it trivial to demo, inspect, or integrate with tooling (`curl`, Postman, Prometheus scrape).
+- Mirrors real systems: etcd, TiKV, and Consul all expose HTTP/gRPC APIs over their internal storage engines.
+
+#### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/key/:key` | Point lookup. Returns `{"key":…,"value":…}` or 404. |
+| `PUT` | `/key/:key` | Insert / overwrite. Request body = value string. |
+| `DELETE` | `/key/:key` | Delete (tombstone). |
+| `GET` | `/scan?from=&to=` | Range scan. Returns JSON array of `{key,value}`. |
+| `GET` | `/prefix/:prefix` | Prefix scan. Returns JSON array of `{key,value}`. |
+| `GET` | `/snapshot` | Consistent point-in-time snapshot `{seq, entries:[…]}`. |
+| `GET` | `/stats` | Engine statistics (memtable size, SSTable count, levels). |
+
+All endpoints accept an optional `?cf=name` query parameter to target a specific column family (default: `"default"`).
+
+#### Starting the server
+
+```rust
+use lsmdb::{SharedLsmEngine, http_api};
+use tokio::net::TcpListener;
+
+#[tokio::main]
+async fn main() {
+    let db  = SharedLsmEngine::open("/data/mydb").unwrap();
+    let app = http_api::make_router(db);
+    let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+```
+
+```bash
+# Point lookup
+curl http://localhost:8080/key/hello
+
+# Insert
+curl -X PUT http://localhost:8080/key/hello -d "world"
+
+# Prefix scan
+curl "http://localhost:8080/prefix/sensor:device_A:"
+
+# Snapshot
+curl http://localhost:8080/snapshot
+```
+
+---
+
+### #12 Replication
+
+**File:** `src/replication.rs`
+
+Streams WAL records from a **leader** to one or more **followers** over TCP. This is the same conceptual approach used by TiKV (Raft log), CockroachDB (Raft), and most distributed KV stores.
+
+#### Why WAL-based replication?
+
+The WAL is already a durable, ordered log of every mutation. Tailing it and shipping records to replicas gives:
+
+- **Durability on followers** — each follower applies the same mutations in the same order.
+- **Point-in-time catch-up** — a new replica starts from byte 0 of the WAL and replays history.
+- **Minimal coupling** — the leader just appends to a file; the follower just reads from a socket.
+
+#### Wire format
+
+Each record on the wire is length-prefixed:
+
+```
+[frame_len: u32 BE][opcode: u8][key_len: u32 BE][key][seq: u64 LE][val_len: u32 BE][val]?
+```
+
+This matches the on-disk WAL format (minus the trailing CRC), so `WalRecord::decode_frame` used for recovery doubles as the replication deserializer.
+
+#### Usage
+
+```rust
+// Leader side
+let server = ReplicationServer::new("0.0.0.0:9001", "/data/mydb/default/wal", "default");
+tokio::spawn(async move { server.serve().await.unwrap() });
+
+// Follower side
+let follower_db = SharedLsmEngine::open("/data/replica").unwrap();
+let client = ReplicationClient::new("leader:9001", follower_db, "default");
+tokio::spawn(async move { client.run().await.unwrap() });
+```
+
+The client reconnects automatically with exponential backoff (200 ms → 30 s) if the leader becomes unavailable.
+
+---
+
+### #13 Benchmark Suite
+
+**File:** `benches/bench.rs`
+
+Measures four fundamental performance dimensions using [criterion](https://github.com/bheisler/criterion.rs):
+
+| Benchmark | What it measures |
+|-----------|-----------------|
+| `write_throughput/sequential_put` | Raw put throughput — one key per iteration |
+| `write_batch/batch_100` | WriteBatch throughput — 100 keys per iteration |
+| `read_random/get_random_10k` | Random-key get latency over a 10 000-key dataset |
+| `read_sequential/full_scan_1k` | Full cursor scan over 1 000 keys |
+| `scan_prefix/prefix_100_of_1000` | Prefix scan (100-key hit / 1 000-key total) |
+
+#### Running
+
+```bash
+# Run all benchmarks and open HTML report
+cargo bench
+
+# Run a single group
+cargo bench -- write_throughput
+
+# Quick smoke-test (no timing, just correctness)
+cargo test --benches
+```
+
+Criterion writes HTML reports to `target/criterion/`.
+
+#### Interpreting results
+
+- **Write throughput** is bounded by WAL `fsync` on every put. Batching amortizes that cost — expect `write_batch` to be significantly faster per key than `sequential_put`.
+- **Random reads** hit the MemTable first; misses fall through to the bloom filter, then SSTable blocks. Latency grows as the dataset exceeds the block cache.
+- **Prefix scans** use the merge-heap cursor filtered by key prefix — latency grows with SSTable count, not total key count.
+
+---
+
+## 12. Further Reading
 
 | Resource | Why read it |
 |---|---|

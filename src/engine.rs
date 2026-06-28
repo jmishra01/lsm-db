@@ -781,6 +781,9 @@ impl SharedLsmEngine {
     pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.0.read().unwrap().scan_prefix(prefix)
     }
+    pub fn scan_prefix_cf(&self, cf: &str, prefix: impl AsRef<[u8]>) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.0.read().unwrap().scan_prefix_cf(cf, prefix)
+    }
     pub fn write_batch(&self, batch: WriteBatch) -> io::Result<()> {
         self.0.write().unwrap().write_batch(batch)
     }
