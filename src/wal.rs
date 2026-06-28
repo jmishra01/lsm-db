@@ -5,31 +5,27 @@
 // between the WAL write and the MemTable update, the WAL record
 // still exists on disk and will be replayed on next open().
 //
-// If we wrote to the MemTable first and crashed before the WAL
-// write, the record would be silently lost — an unacceptable
-// data-loss scenario.
-//
 // The WAL is truncated (replaced with a fresh empty file) each
-// time the MemTable is flushed to an SSTable. After a successful
-// flush the SSTable IS the durable record; the WAL entries it
-// covered are no longer needed for recovery.
+// time the MemTable is flushed to an SSTable.
 //
-// CRC32 checksums (#5)
-// --------------------
+// CRC32 checksums
+// ---------------
 // Each record has a 4-byte CRC32 appended. The CRC covers all
-// payload bytes in that record (tag + key_len + key [+ val_len + val]).
+// payload bytes. On recovery, a mismatch stops replay immediately.
 //
-// On recovery, if the CRC of a record does not match the stored value
-// we stop replaying immediately. Everything before the corrupt record
-// is safe; everything from that point on is discarded. This handles:
-//   - Bit-rot: silent hardware corruption of stored bytes.
-//   - Torn writes: crash mid-write leaves a partial record whose
-//     bytes happen to decode as valid lengths but with wrong content.
+// Sequence numbers (#10 MVCC)
+// ---------------------------
+// Each record now carries a u64 write_seq. This is the global
+// monotonic counter incremented on every write. It serves two purposes:
+//   1. After a crash, WAL replay can recover the exact seq of each
+//      MemTable entry, ensuring the write_seq counter restarts above
+//      the highest seq seen in the recovered data.
+//   2. Snapshots can filter MemTable entries by seq ≤ snapshot_seq.
 //
 // Record wire format
 // ------------------
-//  Put:    [0x00][key_len: u32 BE][key][val_len: u32 BE][val][crc32: u32 LE]
-//  Delete: [0x01][key_len: u32 BE][key][crc32: u32 LE]
+//  Put:    [0x00][key_len: u32 BE][key][seq: u64 LE][val_len: u32 BE][val][crc32: u32 LE]
+//  Delete: [0x01][key_len: u32 BE][key][seq: u64 LE][crc32: u32 LE]
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -37,8 +33,8 @@ use std::path::Path;
 
 #[derive(Debug)]
 pub enum WalRecord {
-    Put { key: Vec<u8>, value: Vec<u8> },
-    Delete { key: Vec<u8> },
+    Put { key: Vec<u8>, seq: u64, value: Vec<u8> },
+    Delete { key: Vec<u8>, seq: u64 },
 }
 
 pub struct Wal {
@@ -51,11 +47,12 @@ impl Wal {
         Ok(Self { writer: BufWriter::new(file) })
     }
 
-    pub fn append_put(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<()> {
-        let mut payload = Vec::with_capacity(1 + 4 + key.len() + 4 + value.len());
+    pub fn append_put(&mut self, key: Vec<u8>, seq: u64, value: Vec<u8>) -> io::Result<()> {
+        let mut payload = Vec::with_capacity(1 + 4 + key.len() + 8 + 4 + value.len());
         payload.push(0u8);
         payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
         payload.extend_from_slice(&key);
+        payload.extend_from_slice(&seq.to_le_bytes());
         payload.extend_from_slice(&(value.len() as u32).to_be_bytes());
         payload.extend_from_slice(&value);
         let crc = crc32fast::hash(&payload);
@@ -64,11 +61,12 @@ impl Wal {
         self.writer.flush()
     }
 
-    pub fn append_delete(&mut self, key: Vec<u8>) -> io::Result<()> {
-        let mut payload = Vec::with_capacity(1 + 4 + key.len());
+    pub fn append_delete(&mut self, key: Vec<u8>, seq: u64) -> io::Result<()> {
+        let mut payload = Vec::with_capacity(1 + 4 + key.len() + 8);
         payload.push(1u8);
         payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
         payload.extend_from_slice(&key);
+        payload.extend_from_slice(&seq.to_le_bytes());
         let crc = crc32fast::hash(&payload);
         self.writer.write_all(&payload)?;
         self.writer.write_all(&crc.to_le_bytes())?;
@@ -99,6 +97,13 @@ impl Wal {
                 Err(e) => return Err(e),
             };
 
+            // Sequence number (8 bytes LE) follows the key
+            let seq = match read_u64_le(&mut reader) {
+                Ok(s) => s,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            };
+
             let value = if tag[0] == 0 {
                 match read_bytes(&mut reader) {
                     Ok(v) => Some(v),
@@ -122,6 +127,7 @@ impl Wal {
             let mut payload = vec![tag[0]];
             payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
             payload.extend_from_slice(&key);
+            payload.extend_from_slice(&seq.to_le_bytes());
             if let Some(ref v) = value {
                 payload.extend_from_slice(&(v.len() as u32).to_be_bytes());
                 payload.extend_from_slice(v);
@@ -129,15 +135,17 @@ impl Wal {
             let computed_crc = crc32fast::hash(&payload);
 
             if stored_crc != computed_crc {
-                // Bit-rot or torn write detected. Stop here — do not replay
-                // anything further; the bytes after this point are untrustworthy.
-                eprintln!("WAL: CRC mismatch — stopping recovery at corrupt record (recovered {} records before it)", records.len());
+                eprintln!(
+                    "WAL: CRC mismatch — stopping recovery at corrupt record \
+                     (recovered {} records before it)",
+                    records.len()
+                );
                 break;
             }
 
             match value {
-                Some(v) => records.push(WalRecord::Put { key, value: v }),
-                None => records.push(WalRecord::Delete { key }),
+                Some(v) => records.push(WalRecord::Put { key, seq, value: v }),
+                None    => records.push(WalRecord::Delete { key, seq }),
             }
         }
 
@@ -152,4 +160,10 @@ fn read_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+fn read_u64_le(r: &mut impl Read) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
 }

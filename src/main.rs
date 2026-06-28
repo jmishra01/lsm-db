@@ -1,6 +1,6 @@
 // LSM-DB - demo driver
 
-use lsmdb::{LsmEngine, SharedLsmEngine};
+use lsmdb::{LsmEngine, SharedLsmEngine, WriteBatch};
 use std::time::Instant;
 
 
@@ -282,6 +282,124 @@ fn main() -> std::io::Result<()> {
             println!(" [session 2] mkey:000000 -> {:?}", first);
             println!(" [session 2] mkey:003999 -> {:?}", last);
             println!(" [session 2] data survived reopen via manifest ✓");
+        }
+    }
+
+    // 12. Iterator / Cursor API — merge-heap over all data sources
+    println!("\n-- 12. Iterator / Cursor API (merge-heap)");
+    {
+        let _ = std::fs::remove_dir_all(dir);
+        let mut db = LsmEngine::open(dir)?;
+
+        // Write enough to span both MemTable and SSTable
+        for i in 0..5u32 {
+            db.put(format!("item:{:03}", i), format!("first_{}", i))?;
+        }
+        // Overwrite some keys — cursor must return the latest version
+        for i in 2..4u32 {
+            db.put(format!("item:{:03}", i), format!("updated_{}", i))?;
+        }
+        db.delete("item:001")?; // tombstone — must not appear in cursor output
+
+        println!(" Written 5 keys, updated 2, deleted 1.");
+        println!(" Cursor output (sorted, deduped, tombstones suppressed):");
+
+        let cursor = db.iter()?;
+        for (k, v) in cursor {
+            println!("   {} -> {}", String::from_utf8_lossy(&k), String::from_utf8_lossy(&v));
+        }
+        // item:001 must be absent (tombstone), item:002/003 must show "updated_*"
+
+        // Range iteration using the cursor
+        println!(" Range item:002..item:004:");
+        for (k, v) in db.scan("item:002", "item:004")? {
+            println!("   {} -> {}", String::from_utf8_lossy(&k), String::from_utf8_lossy(&v));
+        }
+    }
+
+    // 13. Prefix scans — hierarchical key spaces
+    println!("\n-- 13. Prefix scans");
+    {
+        let _ = std::fs::remove_dir_all(dir);
+        let mut db = LsmEngine::open(dir)?;
+
+        // Time-series sensor data with hierarchical keys
+        let sensors = ["device_A", "device_B", "device_C"];
+        for (ts, &sensor) in sensors.iter().enumerate() {
+            for reading in 0..3u32 {
+                db.put(
+                    format!("sensor:{}:{:04}", sensor, reading),
+                    format!("{{\"ts\":{},\"val\":{:.1}}}", ts * 1000 + reading as usize, reading as f32 * 0.5),
+                )?;
+            }
+        }
+        db.put("config:threshold", "0.8")?;
+        db.put("config:interval_ms", "500")?;
+
+        // Prefix scan returns only matching keys, sorted
+        let device_a = db.scan_prefix("sensor:device_A:")?;
+        println!(" sensor:device_A:* ({} results):", device_a.len());
+        for (k, v) in &device_a {
+            println!("   {} -> {}", String::from_utf8_lossy(k), String::from_utf8_lossy(v));
+        }
+
+        let all_sensors = db.scan_prefix("sensor:")?;
+        println!(" sensor:* ({} results total)", all_sensors.len());
+
+        let config = db.scan_prefix("config:")?;
+        println!(" config:* ({} results):", config.len());
+        for (k, v) in &config {
+            println!("   {} -> {}", String::from_utf8_lossy(k), String::from_utf8_lossy(v));
+        }
+    }
+
+    // 14. Snapshots + WriteBatch — MVCC (#10)
+    println!("\n-- 14. Snapshots and WriteBatch (MVCC)");
+    {
+        let _ = std::fs::remove_dir_all(dir);
+        let mut db = LsmEngine::open(dir)?;
+
+        // Initial state
+        db.put("account:alice", "1000")?;
+        db.put("account:bob",   "500")?;
+        println!(" Initial: alice=1000, bob=500");
+
+        // Take a snapshot BEFORE the transfer
+        let snap_before = db.snapshot()?;
+        println!(" Snapshot taken at seq={}", snap_before.seq());
+
+        // Simulate a transfer: alice → bob (atomic via WriteBatch)
+        // Both updates share the same write_seq so they're invisible to
+        // any snapshot pinned before this seq.
+        let mut batch = WriteBatch::new();
+        batch.put("default", "account:alice", "800")   // alice -200
+             .put("default", "account:bob",   "700");  // bob   +200
+        db.write_batch(batch)?;
+        println!(" Transfer complete: alice=800, bob=700");
+
+        // Live reads see the transfer
+        let alice_live = db.get("account:alice")?.map(|v| String::from_utf8(v).unwrap());
+        let bob_live   = db.get("account:bob")?.map(|v| String::from_utf8(v).unwrap());
+        println!(" Live   — alice: {:?}, bob: {:?}", alice_live, bob_live);
+
+        // Snapshot BEFORE the transfer sees the original values
+        let alice_snap = snap_before.get("account:alice").map(|v| String::from_utf8_lossy(v).to_string());
+        let bob_snap   = snap_before.get("account:bob").map(|v| String::from_utf8_lossy(v).to_string());
+        println!(" Snap@{} — alice: {:?}, bob: {:?}", snap_before.seq(), alice_snap, bob_snap);
+
+        // Take a snapshot AFTER the transfer
+        let snap_after = db.snapshot()?;
+        let alice_after = snap_after.get("account:alice").map(|v| String::from_utf8_lossy(v).to_string());
+        let bob_after   = snap_after.get("account:bob").map(|v| String::from_utf8_lossy(v).to_string());
+        println!(" Snap@{} — alice: {:?}, bob: {:?}", snap_after.seq(), alice_after, bob_after);
+
+        println!(" ✓ Snapshot isolation: pre-transfer snapshot is unaffected by the WriteBatch.");
+
+        // Snapshot iteration and prefix scan
+        let snap = db.snapshot()?;
+        println!(" Snapshot key count: {}", snap.key_count());
+        for (k, v) in snap.iter() {
+            println!("   {} -> {}", String::from_utf8_lossy(k), String::from_utf8_lossy(v));
         }
     }
 

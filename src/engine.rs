@@ -4,10 +4,13 @@
 // #1  SharedLsmEngine  — Arc<RwLock<>> concurrent wrapper
 // #2  Background compaction thread
 // #3  Block cache (hot blocks stay in memory)
-// #4  SSTable v3 — sparse index + LZ4 blocks + CRC32
+// #4  SSTable v4 — sparse index + LZ4 blocks + CRC32
 // #5  CRC32 checksums on WAL records and SSTable blocks
 // #6  Column families — independent key spaces
 // #7  Manifest — durable log of live SSTable files
+// #8  Cursor / Iterator — merge-heap over all sources
+// #9  Prefix scans
+// #10 Snapshots + WriteBatch MVCC
 // =====================================================
 
 use std::collections::HashMap;
@@ -21,8 +24,10 @@ use std::thread;
 
 use crate::block_cache::BlockCache;
 use crate::compaction::{l0_needs_compaction, merge_entries, next_sstable_path, write_merged, L1_BASE_BYTES, SIZE_RATIO};
+use crate::iter::{Cursor, SstableBlockIter};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::memtable::MemTable;
+use crate::snapshot::{Snapshot, WriteBatch};
 use crate::sstable::SSTable;
 use crate::wal::{Wal, WalRecord};
 
@@ -31,21 +36,9 @@ const MAX_LEVELS: usize = 7;
 const BLOCK_CACHE_CAPACITY: usize = 512;
 
 // ---- Column-family state (#6) -----------------------------------------------
-//
-// Each column family is an independent key space with its own:
-//   - WAL file       (dir/{cf_name}/wal.log)
-//   - SSTable files  (dir/{cf_name}/L{n}_{seq}.sst)
-//   - MemTable
-//   - Level hierarchy
-//
-// The global seq counter and block cache are shared across all CFs because:
-//   - Shared seq: guarantees unique filenames even if two CFs flush
-//     simultaneously (future multi-threaded writes).
-//   - Shared cache: a single LRU budget across all CFs is more efficient
-//     than per-CF caches that can starve each other.
 
 struct CfState {
-    #[allow(dead_code)] // stored for introspection / future stats
+    #[allow(dead_code)]
     name: String,
     cf_dir: PathBuf,
     wal: Wal,
@@ -112,7 +105,6 @@ pub struct Stats {
     pub immutable_count: usize,
     pub level_file_counts: Vec<usize>,
     pub total_ss_table_files: usize,
-    /// Names of all open column families.
     pub column_families: Vec<String>,
 }
 
@@ -120,53 +112,54 @@ pub struct Stats {
 
 pub struct LsmEngine {
     dir: PathBuf,
-    /// One entry per column family. (#6)
     families: HashMap<String, CfState>,
+    /// Naming seq: generates unique SSTable file names.
     seq: Arc<AtomicU64>,
+    /// Write seq: incremented on every user write, powers MVCC (#10).
+    write_seq: Arc<AtomicU64>,
     cache: Arc<BlockCache>,
     compact: CompactionWorker,
-    /// Durable record of live SSTable files. (#7)
     manifest: Manifest,
 }
 
 impl LsmEngine {
     // -- Open / create
 
-    /// Open the engine with only the "default" column family.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Self::open_with_cfs(path, &["default"])
     }
 
-    /// Open the engine, ensuring the listed column families exist.
-    /// CFs not in the list but present in the manifest are also loaded.
-    /// New names in the list that are absent from the manifest are created.
     pub fn open_with_cfs<P: AsRef<Path>>(path: P, cf_names: &[&str]) -> io::Result<Self> {
         let dir = path.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
-        // (#7) Replay manifest to determine the current set of live SSTable files.
-        // This replaces the directory scan used before: the manifest is the single
-        // authoritative source of which files are current, even after a crash.
         let manifest_path = dir.join("MANIFEST");
         let mstate = Manifest::recover(&manifest_path)?;
         let mut manifest = Manifest::open(&manifest_path)?;
 
         let mut families: HashMap<String, CfState> = HashMap::new();
-        let mut max_seq: u64 = 0;
+        let mut max_naming_seq: u64 = 0;
+        let mut max_write_seq: u64 = 0;
 
         // Load CFs recorded in manifest
         for cf_name in &mstate.cfs {
             let cf_dir = dir.join(cf_name);
             fs::create_dir_all(&cf_dir)?;
 
-            // WAL recovery for this CF
+            // WAL recovery: restore MemTable entries with their original seqs (#10)
             let wal_path = cf_dir.join("wal.log");
             let wal_records = Wal::recover(&wal_path)?;
             let mut mem = MemTable::new();
             for rec in wal_records {
                 match rec {
-                    WalRecord::Put { key, value } => mem.put(key, value),
-                    WalRecord::Delete { key } => mem.delete(key),
+                    WalRecord::Put { key, seq, value } => {
+                        if seq > max_write_seq { max_write_seq = seq; }
+                        mem.put_seq(key, value, seq);
+                    }
+                    WalRecord::Delete { key, seq } => {
+                        if seq > max_write_seq { max_write_seq = seq; }
+                        mem.delete_seq(key, seq);
+                    }
                 }
             }
             let wal = Wal::open(&wal_path)?;
@@ -174,17 +167,19 @@ impl LsmEngine {
             let mut cf = CfState::new(cf_name.clone(), cf_dir.clone(), wal);
             cf.mem = mem;
 
-            // Load SSTables per manifest (not by directory scan)
             let empty = vec![];
             let file_list = mstate.files.get(cf_name).unwrap_or(&empty);
             for (level, filename) in file_list {
-                // Advance global seq counter past all known seq numbers
                 if let Some(seq) = seq_from_filename(filename) {
-                    if seq > max_seq { max_seq = seq; }
+                    if seq > max_naming_seq { max_naming_seq = seq; }
                 }
                 let path = cf_dir.join(filename);
                 match SSTable::open(&path, *level) {
                     Ok(sst) if (*level as usize) < MAX_LEVELS => {
+                        // Track max write_seq seen in any SSTable for recovery (#10)
+                        if sst.max_write_seq > max_write_seq {
+                            max_write_seq = sst.max_write_seq;
+                        }
                         cf.levels[*level as usize].push(sst);
                     }
                     Ok(_) => {}
@@ -213,7 +208,8 @@ impl LsmEngine {
         Ok(Self {
             dir,
             families,
-            seq: Arc::new(AtomicU64::new(max_seq + 1)),
+            seq: Arc::new(AtomicU64::new(max_naming_seq + 1)),
+            write_seq: Arc::new(AtomicU64::new(max_write_seq + 1)),
             cache,
             compact,
             manifest,
@@ -222,11 +218,8 @@ impl LsmEngine {
 
     // -- Column family management (#6)
 
-    /// Create a new column family at runtime.
     pub fn create_cf(&mut self, name: &str) -> io::Result<()> {
-        if self.families.contains_key(name) {
-            return Ok(()); // already exists
-        }
+        if self.families.contains_key(name) { return Ok(()); }
         let cf_dir = self.dir.join(name);
         fs::create_dir_all(&cf_dir)?;
         let wal_path = cf_dir.join("wal.log");
@@ -244,7 +237,6 @@ impl LsmEngine {
 
     // -- Write path
 
-    /// Write to the "default" column family.
     pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> io::Result<()> {
         self.put_cf("default", key, value)
     }
@@ -253,7 +245,6 @@ impl LsmEngine {
         self.delete_cf("default", key)
     }
 
-    /// Write to an explicit column family.
     pub fn put_cf(
         &mut self,
         cf: &str,
@@ -262,23 +253,65 @@ impl LsmEngine {
     ) -> io::Result<()> {
         let key = key.into();
         let value = value.into();
+        // Assign a write_seq before taking the mutable borrow on the CF state.
+        // AtomicU64::fetch_add only needs &self so the borrow is immediately released.
+        let seq = self.write_seq.fetch_add(1, Ordering::SeqCst);
         let cf_state = self.cf_mut(cf)?;
-        cf_state.wal.append_put(key.clone(), value.clone())?;
-        cf_state.mem.put(key, value);
+        cf_state.wal.append_put(key.clone(), seq, value.clone())?;
+        cf_state.mem.put_seq(key, value, seq);
         self.maybe_flush_and_compact(cf)
     }
 
     pub fn delete_cf(&mut self, cf: &str, key: impl Into<Vec<u8>>) -> io::Result<()> {
         let key = key.into();
+        let seq = self.write_seq.fetch_add(1, Ordering::SeqCst);
         let cf_state = self.cf_mut(cf)?;
-        cf_state.wal.append_delete(key.clone())?;
-        cf_state.mem.delete(key);
+        cf_state.wal.append_delete(key.clone(), seq)?;
+        cf_state.mem.delete_seq(key, seq);
         self.maybe_flush_and_compact(cf)
+    }
+
+    /// Atomic multi-key write (#10).
+    /// All entries in the batch receive the SAME write_seq, making them atomically
+    /// visible: a snapshot at seq < batch_seq sees none; seq ≥ batch_seq sees all.
+    pub fn write_batch(&mut self, batch: WriteBatch) -> io::Result<()> {
+        if batch.is_empty() { return Ok(()); }
+        let seq = self.write_seq.fetch_add(1, Ordering::SeqCst);
+
+        // Collect CF names to check for flush after all writes
+        let mut cfs_touched: Vec<String> = Vec::new();
+
+        for (cf, key, value_opt) in batch.entries {
+            let cf_state = self.families.get_mut(&cf).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("column family '{cf}' not found"))
+            })?;
+            match value_opt {
+                Some(value) => {
+                    cf_state.wal.append_put(key.clone(), seq, value.clone())?;
+                    cf_state.mem.put_seq(key, value, seq);
+                }
+                None => {
+                    cf_state.wal.append_delete(key.clone(), seq)?;
+                    cf_state.mem.delete_seq(key, seq);
+                }
+            }
+            if !cfs_touched.contains(&cf) {
+                cfs_touched.push(cf);
+            }
+        }
+
+        let unique: Vec<String> = {
+            let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
+            cfs_touched.into_iter().filter(|c| s.insert(c.clone())).collect()
+        };
+        for cf in unique {
+            self.maybe_flush_and_compact(&cf)?;
+        }
+        Ok(())
     }
 
     // -- Read path
 
-    /// Read from the "default" column family.
     pub fn get(&self, key: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>> {
         self.get_cf("default", key)
     }
@@ -305,7 +338,7 @@ impl LsmEngine {
         }
         for level_files in &cf_state.levels {
             for sst in level_files.iter().rev() {
-                match sst.get(key, Some(&self.cache))? {
+                match sst.get(key, u64::MAX, Some(&self.cache))? {
                     Some(Some(v)) => return Ok(Some(v)),
                     Some(None)    => return Ok(None),
                     None          => {}
@@ -321,35 +354,63 @@ impl LsmEngine {
         from: impl AsRef<[u8]>,
         to: impl AsRef<[u8]>,
     ) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        use std::collections::BTreeMap;
-        let from = from.as_ref();
-        let to   = to.as_ref();
-        let cf_state = self.cf(cf)?;
-        let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        let from = from.as_ref().to_vec();
+        let to   = to.as_ref().to_vec();
+        // Use the merge-heap cursor for correctness and deduplication (#8)
+        let cursor = self.make_cursor_at(cf, u64::MAX)?;
+        Ok(cursor
+            .skip_while(|(k, _)| k.as_slice() < from.as_slice())
+            .take_while(|(k, _)| k.as_slice() < to.as_slice())
+            .collect())
+    }
 
-        for level_files in cf_state.levels.iter().rev() {
-            for sst in level_files.iter() {
-                for (k, v) in sst.scan_all()? {
-                    if k.as_slice() >= from && k.as_slice() < to {
-                        map.insert(k, v);
-                    }
-                }
-            }
-        }
-        for imm in cf_state.imm.iter() {
-            for (k, v) in imm.iter() {
-                if k.as_slice() >= from && k.as_slice() < to {
-                    map.insert(k.clone(), v.clone());
-                }
-            }
-        }
-        for (k, v) in cf_state.mem.iter() {
-            if k.as_slice() >= from && k.as_slice() < to {
-                map.insert(k.clone(), v.clone());
-            }
-        }
+    // -- Iterator / Cursor (#8)
 
-        Ok(map.into_iter().filter_map(|(k, v)| v.map(|val| (k, val))).collect())
+    /// Return a Cursor over the "default" column family (current state).
+    pub fn iter(&self) -> io::Result<Cursor> {
+        self.iter_cf("default")
+    }
+
+    /// Return a Cursor over the named column family.
+    pub fn iter_cf(&self, cf: &str) -> io::Result<Cursor> {
+        self.make_cursor_at(cf, u64::MAX)
+    }
+
+    // -- Prefix scans (#9)
+
+    /// Return all live (key, value) pairs whose key starts with `prefix`.
+    pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_prefix_cf("default", prefix)
+    }
+
+    pub fn scan_prefix_cf(
+        &self,
+        cf: &str,
+        prefix: impl AsRef<[u8]>,
+    ) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let prefix = prefix.as_ref().to_vec();
+        let cursor = self.make_cursor_at(cf, u64::MAX)?;
+        Ok(cursor
+            .skip_while(|(k, _)| k.as_slice() < prefix.as_slice())
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .collect())
+    }
+
+    // -- Snapshots (#10)
+
+    /// Capture a consistent point-in-time snapshot of the "default" CF.
+    pub fn snapshot(&self) -> io::Result<Snapshot> {
+        self.snapshot_cf("default")
+    }
+
+    /// Capture a consistent point-in-time snapshot of the named CF.
+    /// The snapshot_seq is pinned to the current write_seq; any writes
+    /// arriving concurrently with or after this call are invisible to it.
+    pub fn snapshot_cf(&self, cf: &str) -> io::Result<Snapshot> {
+        let snapshot_seq = self.write_seq.load(Ordering::SeqCst).saturating_sub(1);
+        let cursor = self.make_cursor_at(cf, snapshot_seq)?;
+        let data: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = cursor.collect();
+        Ok(Snapshot::new(snapshot_seq, data))
     }
 
     // -- Stats
@@ -391,6 +452,58 @@ impl LsmEngine {
         })
     }
 
+    /// Build a Cursor over `cf` that only sees entries with seq ≤ max_seq.
+    /// Source ordering (lower index = newer, wins deduplication):
+    ///   0:         active MemTable
+    ///   1..n:      immutable MemTables, newest-flushed first
+    ///   n+1..:     L0 SSTables, most recently created first
+    ///   remaining: L1+ SSTables in level order
+    fn make_cursor_at(&self, cf: &str, max_seq: u64) -> io::Result<Cursor> {
+        let cf_state = self.cf(cf)?;
+        let mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, u64, Option<Vec<u8>>)> + Send>> =
+            Vec::new();
+
+        // Active MemTable — clone data so the cursor outlives the borrow
+        let mem_entries: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = cf_state.mem.iter()
+            .filter(|(_, (seq, _))| *seq <= max_seq)
+            .map(|(k, (seq, v))| (k.clone(), *seq, v.clone()))
+            .collect();
+        sources.push(Box::new(mem_entries.into_iter()));
+
+        // Immutable MemTables, newest first (imm is appended; last = newest)
+        for imm in cf_state.imm.iter().rev() {
+            let entries: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = imm.iter()
+                .filter(|(_, (seq, _))| *seq <= max_seq)
+                .map(|(k, (seq, v))| (k.clone(), *seq, v.clone()))
+                .collect();
+            sources.push(Box::new(entries.into_iter()));
+        }
+
+        // L0 SSTables (may overlap): most recently added last → reverse
+        for sst in cf_state.levels[0].iter().rev() {
+            sources.push(Box::new(SstableBlockIter::new(
+                sst.path.clone(),
+                sst.sparse_index.clone(),
+                Arc::clone(&self.cache),
+                max_seq,
+            )));
+        }
+
+        // L1+ SSTables (non-overlapping within each level)
+        for level_files in cf_state.levels.iter().skip(1) {
+            for sst in level_files.iter() {
+                sources.push(Box::new(SstableBlockIter::new(
+                    sst.path.clone(),
+                    sst.sparse_index.clone(),
+                    Arc::clone(&self.cache),
+                    max_seq,
+                )));
+            }
+        }
+
+        Ok(Cursor::new(sources))
+    }
+
     fn maybe_flush_and_compact(&mut self, cf_name: &str) -> io::Result<()> {
         self.drain_compaction_results();
 
@@ -419,9 +532,6 @@ impl LsmEngine {
         let path = cf_dir.join(&filename);
         let sst = SSTable::write_from_memtable(&path, &flushing, 0)?;
 
-        // (#7) Write manifest BEFORE updating in-memory state.
-        // If we crash after this line the new SST is recorded; on recovery the
-        // WAL replay would add duplicates that the SST already covers — harmless.
         self.manifest.append(&ManifestRecord::AddFile {
             cf: cf_name.to_string(),
             level: 0,
@@ -439,9 +549,6 @@ impl LsmEngine {
     }
 
     fn try_schedule_compaction(&mut self) {
-        // Find the first CF that needs compaction.
-        // Collect the job details without holding a borrow on self.families
-        // so we can then borrow self.compact.tx.
         let job_opt = self.find_compaction_job();
         if let Some(job) = job_opt {
             if self.compact.tx.send(job).is_ok() {
@@ -494,11 +601,6 @@ impl LsmEngine {
 
     fn drain_compaction_results(&mut self) {
         while let Ok(result) = self.compact.rx.lock().unwrap().try_recv() {
-            // (#7) Write manifest removes + add BEFORE touching in-memory state.
-            // Order: RemoveFile old entries first, then AddFile for the new one.
-            // If we crash mid-manifest write, the worst case is a partially
-            // recorded edit — the CRC check in Manifest::recover will stop at the
-            // corrupt record, leaving the previous committed state intact.
             for path in result.merged_source_paths.iter().chain(result.merged_target_paths.iter()) {
                 if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
                     let _ = self.manifest.append(&ManifestRecord::RemoveFile {
@@ -517,7 +619,6 @@ impl LsmEngine {
                 }
             }
 
-            // Update in-memory level lists
             if let Some(cf) = self.families.get_mut(&result.cf_name) {
                 let src_level = result.target_level.saturating_sub(1);
                 for path in &result.merged_source_paths {
@@ -641,8 +742,6 @@ fn seq_from_filename(filename: &str) -> Option<u64> {
 
 // ---- SharedLsmEngine (#1) --------------------------------------------------
 
-/// Thread-safe handle. Multiple clones share one underlying engine via
-/// Arc<RwLock<>>. Reads acquire a shared lock; writes acquire an exclusive lock.
 #[derive(Clone)]
 pub struct SharedLsmEngine(Arc<RwLock<LsmEngine>>);
 
@@ -678,6 +777,15 @@ impl SharedLsmEngine {
     }
     pub fn scan_cf(&self, cf: &str, from: impl AsRef<[u8]>, to: impl AsRef<[u8]>) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.0.read().unwrap().scan_cf(cf, from, to)
+    }
+    pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.0.read().unwrap().scan_prefix(prefix)
+    }
+    pub fn write_batch(&self, batch: WriteBatch) -> io::Result<()> {
+        self.0.write().unwrap().write_batch(batch)
+    }
+    pub fn snapshot(&self) -> io::Result<Snapshot> {
+        self.0.read().unwrap().snapshot()
     }
     pub fn stats(&self) -> Stats {
         self.0.read().unwrap().stats()

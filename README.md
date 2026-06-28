@@ -602,21 +602,212 @@ determine recency: higher-seq files are checked first.
 
 ---
 
+---
+
+## Query Capabilities
+
+### #8 Iterator / Cursor API
+
+**File:** `src/iter.rs` — `Cursor`, `SstableBlockIter`
+
+**The problem with the old `scan_cf()`:**
+The original range scan loaded *all* SSTable data into a `BTreeMap`, then
+filtered the range. For a 1 GB SSTable, scanning 10 keys near the beginning
+would read and decompress the entire file.
+
+**The solution — merge-heap (k-way merge):**
+A `Cursor` maintains one iterator per source (MemTable, each immutable MemTable,
+each SSTable). Each source is pre-sorted. A min-heap merges them:
+
+```
+Sources:            Heap (min by key):
+MemTable: [d, f]       a (from SSTable L0)
+L0 SST:   [a, c]   ──► pop a → advance L0 SST → heap now has [b,c,d,f]
+L1 SST:   [b, e]       pop b → advance L1 SST → heap now has [c,d,e,f]
+                       ...
+```
+
+**Why a heap instead of just sorting all entries?**
+Sorting requires loading all entries first. The heap is *lazy*: each source
+loads one block at a time (`SstableBlockIter` — 4 KiB per load), making memory
+usage proportional to the number of sources × block size, not total data size.
+
+**Deduplication and tombstones:**
+The heap pops in ascending key order. When the same key appears in multiple
+sources (MemTable has the newest write, an older SSTable has a stale copy),
+the MemTable entry (source_id = 0) wins by the heap ordering. Subsequent
+occurrences of the same key are silently skipped. Tombstones (value = None)
+are consumed without yielding to the caller.
+
+**Usage:**
+```rust
+// Forward scan of entire CF
+for (key, value) in db.iter()? {
+    println!("{} = {}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value));
+}
+
+// Range scan (uses Cursor internally)
+for (key, value) in db.scan("key:010", "key:020")? {
+    // ...
+}
+```
+
+---
+
+### #9 Prefix Scans
+
+**File:** `src/engine.rs` — `scan_prefix()`, `scan_prefix_cf()`
+
+**Why prefix scans are natural for LSM-Trees:**
+Because keys are sorted on disk, all keys sharing a common prefix are
+physically adjacent. A prefix scan only needs to read one contiguous slice
+of the key space — no random I/O.
+
+**Implementation:**
+```rust
+pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let cursor = self.make_cursor_at(cf, u64::MAX)?;
+    Ok(cursor
+        .skip_while(|(k, _)| k < prefix)     // advance past keys before prefix
+        .take_while(|(k, _)| k.starts_with(prefix))  // stop when prefix ends
+        .collect())
+}
+```
+
+`skip_while` / `take_while` are O(n) in the entries before/within the prefix.
+A production implementation would add `seek(target_key)` to the cursor so
+each source's iterator can jump directly to the start offset — avoiding reading
+blocks that precede the prefix entirely.
+
+**Canonical use cases:**
+- **Time-series:** `scan_prefix("sensor:device_A:")` returns all readings for device A.
+- **Hierarchical data:** `scan_prefix("user:42:orders:")` returns all orders for user 42.
+- **Tag indexes:** `scan_prefix("tag:rust:")` returns all documents tagged "rust".
+
+**Usage:**
+```rust
+let readings = db.scan_prefix("sensor:device_A:")?;
+for (key, val) in readings {
+    println!("{} -> {}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&val));
+}
+```
+
+---
+
+### #10 Transactions / Snapshots (MVCC)
+
+**Files:** `src/snapshot.rs`, `src/memtable.rs` (MemEntry), `src/wal.rs` (seq field), `src/sstable.rs` (v4 seq per entry)
+
+#### What is MVCC?
+
+Multi-Version Concurrency Control (MVCC) lets readers and writers operate
+without blocking each other. The key idea:
+
+> **Every write is tagged with a monotonically increasing sequence number (`seq`).
+> A reader can "pin" a seq and only see writes with `seq ≤ pinned_seq`.**
+
+This gives consistent point-in-time snapshots even while new writes are landing.
+
+#### How write_seq flows through the system
+
+```
+db.put("k", "v")
+     │
+     ├─ seq = write_seq.fetch_add(1)   ← global AtomicU64, one increment per write
+     │
+     ├─ WAL record:  [tag][key_len][key][seq: u64 LE][val_len][val][crc32]
+     │                                  ╰── stored so crash recovery can restore exact seqs
+     │
+     ├─ MemTable: BTreeMap<key, (seq, value_opt)>
+     │                              ╰── seq stored per entry
+     │
+     └─ (on flush) SSTable block entry: [key_len][key][seq: u64 LE][val_tag][val_len][val]
+                                                       ╰── stored per entry in the block body
+```
+
+The SSTable footer also stores `max_write_seq` — the highest seq of any entry
+in the file. On engine open, `write_seq` is restored to
+`max(max_write_seq across all SSTables, max seq in WAL records) + 1`.
+
+#### Snapshot
+
+```rust
+// Snapshot = frozen BTreeMap materialised at creation time
+let snap = db.snapshot()?; // pins write_seq = S
+println!("snap.seq = {}", snap.seq());
+
+// Reads only return entries with seq ≤ S
+let v = snap.get("account:alice"); // → value as of seq S
+```
+
+Internally, `snapshot()` builds a `Cursor` with `max_seq = current_write_seq - 1`
+and drains it into a `BTreeMap`. Because each source pre-filters by seq, only
+entries that existed at the pinned point are collected.
+
+**Memory cost:** O(total live keys) at snapshot time. For large databases a
+real engine would keep a shared memtable with multi-version entries (like
+RocksDB) to avoid copying; this simpler approach is correct and instructive.
+
+#### WriteBatch — atomic multi-key writes
+
+```rust
+let mut batch = WriteBatch::new();
+batch.put("default", "account:alice", "800")  // debit
+     .put("default", "account:bob",   "700"); // credit
+db.write_batch(batch)?;
+```
+
+All entries in the batch are assigned the **same** `seq`. From any reader's
+perspective they appear simultaneously:
+
+- Snapshot at `seq < batch_seq` → sees neither write (pre-transfer state).
+- Snapshot at `seq ≥ batch_seq` → sees both writes (post-transfer state).
+
+This is "all-or-nothing" at the sequence boundary. It does **not** provide
+full serializable isolation across concurrent transactions — for that you
+would need lock-based or optimistic concurrency control layered on top.
+
+#### MVCC source filtering in the Cursor
+
+Each source (MemTable, SstableBlockIter) pre-filters its entries before they
+enter the merge-heap:
+
+```
+MemTable entries: filter(|(_, (seq, _))| seq ≤ max_seq)
+SstableBlockIter: filter(|(_, seq, _)| seq ≤ max_seq)
+```
+
+Because each source only yields qualifying entries, the merge-heap's
+deduplication logic ("lower source_id wins for duplicate keys") still works
+correctly even under seq filtering. The cursor never yields an entry that
+post-dates the snapshot.
+
+---
+
 ## 10. Running the Demo
 
 ```bash
 cargo run
 ```
 
-The demo exercises all major features:
-1. Basic put / get
-2. Overwrite (latest write wins)
-3. Delete / tombstone
-4. Range scan
-5. High-volume write (1000 keys, triggers compaction path)
-6. Persistence across reopen (WAL recovery)
-7. Engine stats
-8. **Concurrent reads** via `SharedLsmEngine` (4 threads reading simultaneously)
+The demo exercises all 14 major features:
+
+| Section | Feature |
+|---------|---------|
+| 1 | Basic put / get |
+| 2 | Overwrite (latest write wins) |
+| 3 | Delete / tombstone |
+| 4 | Range scan |
+| 5 | High-volume write (1000 keys, triggers compaction path) |
+| 6 | Persistence across reopen (WAL recovery) |
+| 7 | Engine stats |
+| 8 | Concurrent reads via `SharedLsmEngine` (4 threads) |
+| 9 | CRC32 corruption detection in the WAL |
+| 10 | Column families — independent key spaces |
+| 11 | Manifest — durable SSTable inventory |
+| 12 | **Iterator / Cursor API** — merge-heap over MemTable + SSTables |
+| 13 | **Prefix scans** — hierarchical key spaces |
+| 14 | **Snapshots + WriteBatch** — MVCC with seq numbers |
 
 ---
 
