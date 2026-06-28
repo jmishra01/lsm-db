@@ -1,6 +1,18 @@
-// WAL - Write-Ahead Log
-// Every mutation is appended here BEFORE touching the MemTable.
-// On crash recovery the WAL is replayed to rebuild the MemTable.
+// WAL — Write-Ahead Log
+//
+// Every mutation is written here BEFORE touching the MemTable.
+// This is the "write-ahead" guarantee: if the process crashes
+// between the WAL write and the MemTable update, the WAL record
+// still exists on disk and will be replayed on next open().
+//
+// If we wrote to the MemTable first and crashed before the WAL
+// write, the record would be silently lost — an unacceptable
+// data-loss scenario.
+//
+// The WAL is truncated (replaced with a fresh empty file) each
+// time the MemTable is flushed to an SSTable. After a successful
+// flush the SSTable IS the durable record; the WAL entries it
+// covered are no longer needed for recovery.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};

@@ -1,14 +1,28 @@
 // ================================================================================================
-// Compaction -- Leveled compaction strategy
+// Compaction — Leveled compaction strategy
 //
-// Rules
-// -----
-// * L0 may accumulate up to L0_MAX_FILES files (no size guarantee).
-// * L1+ have a size budget: level N holds at most SIZE_RATIO^N x BASE_BYTES.
-// *  When L(n) overflows, one SSTable from L(n) is merged with all overlapping SSTables in L(n+1),
-//    producing new L(n + 1) files.
-// * During merge, for duplicate keys the entry from the LOWER level (more recent) wins.
-//   Tombstones are dropped only at the deepest level.
+// Without compaction:
+//   - L0 accumulates many overlapping files → every read must check all of them (read amp).
+//   - Deleted keys and overwritten values stay in old SSTable files forever (space amp).
+//   - L1+ files could overlap in key range, making it impossible to skip files during reads.
+//
+// Leveled strategy:
+//   L0: special — files may overlap. Triggered when L0 reaches L0_MAX_FILES (4).
+//   L1+: size budgets (1 MiB, 10 MiB, 100 MiB, …). When a level overflows, the oldest
+//        SSTable is picked and merged with all overlapping SSTables in the next level.
+//
+// Why pick the OLDEST L(n) SSTable as the victim?
+//   Round-robin over oldest ensures every SSTable eventually gets compacted. No single
+//   SSTable grows arbitrarily large without being merged.
+//
+// Why drop tombstones ONLY at the deepest level?
+//   A tombstone at L1 may be masking a live entry at L2. Dropping it early would make
+//   the old value "reappear" — a consistency violation. We keep tombstones until we are
+//   certain no older copy of the key exists at any deeper level.
+//
+// Write amplification: with SIZE_RATIO=10 and typical 3 active levels, each byte the
+// user writes is rewritten ~10-30× total. This is the fundamental LSM trade-off:
+// sequential write amplification in exchange for avoiding random writes.
 // ================================================================================================
 
 use std::collections::BTreeMap;
