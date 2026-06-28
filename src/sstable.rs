@@ -1,13 +1,26 @@
 // =============================================================
-// SSTable v2 -- block-compressed Sorted String Table
+// SSTable v3 — block-compressed + CRC32-protected
+//
+// What changed from v2:
+//   Each data block now has a 4-byte CRC32 stored between the
+//   compressed_len field and the compressed bytes. The CRC
+//   covers the compressed payload, so it catches both bit-rot
+//   and incomplete block writes caused by crashes.
+//
+// Why CRC on the compressed bytes (not the decompressed bytes)?
+//   We want to detect corruption *before* attempting decompression.
+//   A corrupted LZ4 stream can cause the decompressor to loop,
+//   crash, or return silently wrong data. Checking the CRC first
+//   gives us a clean early exit.
 //
 // File layout
 // -----------
 //  [ DATA BLOCKS ]
 //    For each block:
 //      compressed_len   : u32 LE
+//      block_crc32      : u32 LE   ← NEW in v3
 //      compressed_data  : [u8; compressed_len]
-//        (LZ4-decompress to get block body)
+//        (verify CRC, then LZ4-decompress to get block body)
 //        Block body:
 //          entry_count  : u32 LE
 //          For each entry:
@@ -32,7 +45,7 @@
 //    bloom_len          : u64 LE
 //    entry_count        : u64 LE
 //    block_count        : u64 LE
-//    magic              : u64 LE = 0xCAFE_F00D_1234_5678
+//    magic              : u64 LE = 0xF00D_CAFE_BABE_1234  (v3)
 // =============================================================
 
 use std::fs::{self, File};
@@ -44,28 +57,29 @@ use crate::block_cache::{BlockCache, BlockKey};
 use crate::bloom::BloomFilter;
 use crate::memtable::MemTable;
 
-const MAGIC: u64 = 0xCAFE_F00D_1234_5678;
+/// v3 magic — different from v2 (0xCAFE_F00D_1234_5678) to prevent
+/// accidentally opening a v2 file with the v3 reader (which expects the
+/// extra CRC field and would misparse block offsets).
+const MAGIC: u64 = 0xF00D_CAFE_BABE_1234;
 const FOOTER_SIZE: usize = 48;
-const BLOCK_TARGET_BYTES: usize = 4 * 1024; // 4 KiB uncompressed target
+const BLOCK_TARGET_BYTES: usize = 4 * 1024;
 
-// ---- SSTable struct --------------------------------------------------------
+// ---- SSTable handle --------------------------------------------------------
 
 pub struct SSTable {
     pub path: PathBuf,
-    /// Sparse index: (first_key_of_block, byte_offset_of_block_in_file)
     sparse_index: Vec<(Vec<u8>, u64)>,
     bloom: BloomFilter,
     pub entry_count: usize,
     pub level: u32,
-    // Stored for informational / future use (e.g. stats, pre-allocating sparse_index).
     #[allow(dead_code)]
     block_count: usize,
 }
 
-// ---- Block builder (accumulates raw entry bytes until threshold) -----------
+// ---- Block builder ---------------------------------------------------------
 
 struct BlockBuilder {
-    buf: Vec<u8>,       // raw serialised entries
+    buf: Vec<u8>,
     entry_count: u32,
     first_key: Option<Vec<u8>>,
 }
@@ -93,14 +107,13 @@ impl BlockBuilder {
     }
 
     fn uncompressed_size(&self) -> usize {
-        4 + self.buf.len() // entry_count header + entries
+        4 + self.buf.len()
     }
 
     fn is_empty(&self) -> bool {
         self.entry_count == 0
     }
 
-    /// Consume builder, returning (first_key, block_body_with_count_header).
     fn finish(self) -> Option<(Vec<u8>, Vec<u8>)> {
         if self.entry_count == 0 {
             return None;
@@ -115,9 +128,6 @@ impl BlockBuilder {
 // ---- SSTable impl ----------------------------------------------------------
 
 impl SSTable {
-    // -- Writer
-
-    /// Flush a MemTable to a new SSTable at `path`.
     pub fn write_from_memtable(path: impl AsRef<Path>, mem: &MemTable, level: u32) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::create(&path)?;
@@ -143,7 +153,7 @@ impl SSTable {
             file_offset = flush_block(&mut w, builder, &mut sparse_index, file_offset, &mut block_count)?;
         }
 
-        // Sparse index section
+        // Sparse index
         let index_offset = file_offset;
         for (first_key, block_off) in &sparse_index {
             w.write_all(&(first_key.len() as u32).to_le_bytes())?;
@@ -151,13 +161,10 @@ impl SSTable {
             w.write_all(&block_off.to_le_bytes())?;
         }
 
-        // Bloom section
+        // Bloom
         let bloom_bytes = bloom.to_bytes();
         let bloom_offset = index_offset
-            + sparse_index
-                .iter()
-                .map(|(k, _)| 4 + k.len() as u64 + 8)
-                .sum::<u64>();
+            + sparse_index.iter().map(|(k, _)| 4 + k.len() as u64 + 8).sum::<u64>();
         let bloom_len = bloom_bytes.len() as u64;
         w.write_all(&bloom_bytes)?;
 
@@ -173,36 +180,33 @@ impl SSTable {
         Ok(Self { path, sparse_index, bloom, entry_count, level, block_count })
     }
 
-    // -- Reader
-
-    /// Load SSTable metadata (sparse index + bloom) from disk.
     pub fn open(path: impl AsRef<Path>, level: u32) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut f = File::open(&path)?;
         let file_size = f.seek(SeekFrom::End(0))?;
 
-        // Footer
         f.seek(SeekFrom::Start(file_size - FOOTER_SIZE as u64))?;
         let mut footer = [0u8; FOOTER_SIZE];
         f.read_exact(&mut footer)?;
-        let index_offset  = u64::from_le_bytes(footer[ 0.. 8].try_into().unwrap());
-        let bloom_offset  = u64::from_le_bytes(footer[ 8..16].try_into().unwrap());
-        let bloom_len     = u64::from_le_bytes(footer[16..24].try_into().unwrap());
-        let entry_count   = u64::from_le_bytes(footer[24..32].try_into().unwrap()) as usize;
-        let block_count   = u64::from_le_bytes(footer[32..40].try_into().unwrap()) as usize;
-        let magic         = u64::from_le_bytes(footer[40..48].try_into().unwrap());
+        let index_offset = u64::from_le_bytes(footer[ 0.. 8].try_into().unwrap());
+        let bloom_offset = u64::from_le_bytes(footer[ 8..16].try_into().unwrap());
+        let bloom_len    = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+        let entry_count  = u64::from_le_bytes(footer[24..32].try_into().unwrap()) as usize;
+        let block_count  = u64::from_le_bytes(footer[32..40].try_into().unwrap()) as usize;
+        let magic        = u64::from_le_bytes(footer[40..48].try_into().unwrap());
 
         if magic != MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad SSTable magic (wrong version?)"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad SSTable magic {magic:#x} — expected {MAGIC:#x} (wrong version?)"),
+            ));
         }
 
-        // Bloom
         f.seek(SeekFrom::Start(bloom_offset))?;
         let mut bloom_bytes = vec![0u8; bloom_len as usize];
         f.read_exact(&mut bloom_bytes)?;
         let bloom = BloomFilter::from_bytes(&bloom_bytes);
 
-        // Sparse index
         f.seek(SeekFrom::Start(index_offset))?;
         let mut reader = BufReader::new(&mut f);
         let mut sparse_index: Vec<(Vec<u8>, u64)> = Vec::with_capacity(block_count);
@@ -219,35 +223,44 @@ impl SSTable {
         Ok(Self { path, sparse_index, bloom, entry_count, level, block_count })
     }
 
-    /// Point lookup. Returns `Some(Some(v))`, `Some(None)` (tombstone), or `None`.
     pub fn get(&self, key: &[u8], cache: Option<&Arc<BlockCache>>) -> io::Result<Option<Option<Vec<u8>>>> {
         if !self.bloom.may_contain(key) {
             return Ok(None);
         }
-
-        // partition_point returns first idx where first_key > key; we want idx-1
         let idx = self.sparse_index.partition_point(|(fk, _)| fk.as_slice() <= key);
         if idx == 0 {
             return Ok(None);
         }
         let (_, block_offset) = &self.sparse_index[idx - 1];
-
         let data = self.load_block(*block_offset, cache)?;
         scan_block_for_key(&data, key)
     }
 
-    /// Full scan -- returns all (key, val_opt) in sorted order (used by compaction).
     pub fn scan_all(&self) -> io::Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
         let mut f = File::open(&self.path)?;
         let mut results = Vec::with_capacity(self.entry_count);
 
         for (_, block_offset) in &self.sparse_index {
             f.seek(SeekFrom::Start(*block_offset))?;
+
             let mut len_buf = [0u8; 4];
             f.read_exact(&mut len_buf)?;
             let clen = u32::from_le_bytes(len_buf) as usize;
+
+            let mut crc_buf = [0u8; 4];
+            f.read_exact(&mut crc_buf)?;
+            let stored_crc = u32::from_le_bytes(crc_buf);
+
             let mut compressed = vec![0u8; clen];
             f.read_exact(&mut compressed)?;
+
+            let computed_crc = crc32fast::hash(&compressed);
+            if stored_crc != computed_crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("block CRC mismatch during scan at offset {block_offset} in {:?}", self.path),
+                ));
+            }
 
             let data = decompress(&compressed)?;
             let mut cursor = Cursor::new(&data);
@@ -266,8 +279,6 @@ impl SSTable {
         fs::remove_file(&self.path)
     }
 
-    // -- Internal helpers
-
     fn load_block(&self, block_offset: u64, cache: Option<&Arc<BlockCache>>) -> io::Result<Arc<Vec<u8>>> {
         let cache_key: BlockKey = (self.path.clone(), block_offset);
 
@@ -279,25 +290,43 @@ impl SSTable {
 
         let mut f = File::open(&self.path)?;
         f.seek(SeekFrom::Start(block_offset))?;
+
         let mut len_buf = [0u8; 4];
         f.read_exact(&mut len_buf)?;
         let clen = u32::from_le_bytes(len_buf) as usize;
+
+        // CRC comes before the compressed bytes in v3
+        let mut crc_buf = [0u8; 4];
+        f.read_exact(&mut crc_buf)?;
+        let stored_crc = u32::from_le_bytes(crc_buf);
+
         let mut compressed = vec![0u8; clen];
         f.read_exact(&mut compressed)?;
+
+        let computed_crc = crc32fast::hash(&compressed);
+        if stored_crc != computed_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "SSTable block CRC mismatch at offset {block_offset} in {:?} \
+                     (stored={stored_crc:#010x}, computed={computed_crc:#010x})",
+                    self.path
+                ),
+            ));
+        }
 
         let data = Arc::new(decompress(&compressed)?);
 
         if let Some(c) = cache {
             c.insert(cache_key, Arc::clone(&data));
         }
-
         Ok(data)
     }
 }
 
 // ---- Free functions --------------------------------------------------------
 
-/// Compress, write block to file, update sparse_index and file_offset.
+/// Compress block body, compute CRC, write [compressed_len][crc32][compressed_data].
 fn flush_block(
     w: &mut BufWriter<File>,
     builder: BlockBuilder,
@@ -307,12 +336,16 @@ fn flush_block(
 ) -> io::Result<u64> {
     if let Some((first_key, body)) = builder.finish() {
         let compressed = lz4_flex::compress_prepend_size(&body);
+        let crc = crc32fast::hash(&compressed);
         let clen = compressed.len() as u32;
+
         sparse_index.push((first_key, file_offset));
         w.write_all(&clen.to_le_bytes())?;
+        w.write_all(&crc.to_le_bytes())?;   // CRC written before data
         w.write_all(&compressed)?;
         *block_count += 1;
-        Ok(file_offset + 4 + compressed.len() as u64)
+        // +4 (compressed_len) + 4 (crc32) + compressed bytes
+        Ok(file_offset + 4 + 4 + compressed.len() as u64)
     } else {
         Ok(file_offset)
     }
@@ -323,7 +356,6 @@ fn decompress(compressed: &[u8]) -> io::Result<Vec<u8>> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
-/// Scan a decompressed block body for a specific key.
 fn scan_block_for_key(data: &[u8], key: &[u8]) -> io::Result<Option<Option<Vec<u8>>>> {
     let mut cursor = Cursor::new(data);
     let count = read_u32_le(&mut cursor)?;

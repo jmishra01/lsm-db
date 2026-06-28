@@ -66,7 +66,7 @@ impl BloomFilter {
     pub fn insert(&mut self, key: &[u8]) {
         let (h1, h2) = hashes(key);
         for i in 0..self.num_hashes {
-            let idx = (h1.wrapping_add(i as u64 * h2)) as usize % self.num_bits;
+            let idx = (h1.wrapping_add((i as u64).wrapping_mul(h2))) as usize % self.num_bits;
             self.bits[idx / 64] |= 1u64 << (idx % 64);
         }
     }
@@ -75,7 +75,7 @@ impl BloomFilter {
     pub fn may_contain(&self, key: &[u8]) -> bool {
         let (h1, h2) = hashes(key);
         for i in 0..self.num_hashes {
-            let idx = (h1.wrapping_add(i as u64 * h2)) as usize % self.num_bits;
+            let idx = (h1.wrapping_add((i as u64).wrapping_mul(h2))) as usize % self.num_bits;
             if self.bits[idx / 64] & (1u64 << (idx % 64)) == 0 {
                 return false;
             }

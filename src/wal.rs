@@ -13,12 +13,28 @@
 // time the MemTable is flushed to an SSTable. After a successful
 // flush the SSTable IS the durable record; the WAL entries it
 // covered are no longer needed for recovery.
+//
+// CRC32 checksums (#5)
+// --------------------
+// Each record has a 4-byte CRC32 appended. The CRC covers all
+// payload bytes in that record (tag + key_len + key [+ val_len + val]).
+//
+// On recovery, if the CRC of a record does not match the stored value
+// we stop replaying immediately. Everything before the corrupt record
+// is safe; everything from that point on is discarded. This handles:
+//   - Bit-rot: silent hardware corruption of stored bytes.
+//   - Torn writes: crash mid-write leaves a partial record whose
+//     bytes happen to decode as valid lengths but with wrong content.
+//
+// Record wire format
+// ------------------
+//  Put:    [0x00][key_len: u32 BE][key][val_len: u32 BE][val][crc32: u32 LE]
+//  Delete: [0x01][key_len: u32 BE][key][crc32: u32 LE]
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-/// A single WAL record.
 #[derive(Debug)]
 pub enum WalRecord {
     Put { key: Vec<u8>, value: Vec<u8> },
@@ -30,41 +46,38 @@ pub struct Wal {
 }
 
 impl Wal {
-    /// Open (or create) a WAL file at `path`.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Wal> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        Ok(Self {
-            writer: BufWriter::new(file),
-        })
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self { writer: BufWriter::new(file) })
     }
 
-    /// Append a Put record.
     pub fn append_put(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<()> {
-        // Format: [type:1][key_len:4][val_len:4][val]
-        self.writer.write_all(&[0u8])?;
-        self.writer.write_all(&key.len().to_be_bytes())?;
-        self.writer.write_all(&key)?;
-        self.writer.write_all(&value.len().to_be_bytes())?;
-        self.writer.write_all(&value)?;
+        let mut payload = Vec::with_capacity(1 + 4 + key.len() + 4 + value.len());
+        payload.push(0u8);
+        payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&key);
+        payload.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&value);
+        let crc = crc32fast::hash(&payload);
+        self.writer.write_all(&payload)?;
+        self.writer.write_all(&crc.to_le_bytes())?;
         self.writer.flush()
     }
 
-    /// Append a Delete (tombstone) record.
     pub fn append_delete(&mut self, key: Vec<u8>) -> io::Result<()> {
-        // Format: [type:1][key_len:4][key]
-        self.writer.write_all(&[1u8])?;
-        self.writer.write_all(&key.len().to_be_bytes())?;
-        self.writer.write_all(&key)?;
+        let mut payload = Vec::with_capacity(1 + 4 + key.len());
+        payload.push(1u8);
+        payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&key);
+        let crc = crc32fast::hash(&payload);
+        self.writer.write_all(&payload)?;
+        self.writer.write_all(&crc.to_le_bytes())?;
         self.writer.flush()
     }
 
-    /// Read all  records from an existing WAL file (for recovery).
     pub fn recover(path: impl AsRef<Path>) -> io::Result<Vec<WalRecord>> {
         let file = match File::open(&path) {
-            Ok(file) => file,
+            Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
@@ -72,28 +85,62 @@ impl Wal {
         let mut records = Vec::new();
 
         loop {
+            // Tag byte — clean EOF here means we're done
             let mut tag = [0u8; 1];
             match reader.read_exact(&mut tag) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             }
+
             let key = match read_bytes(&mut reader) {
                 Ok(k) => k,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             };
-            if tag[0] == 0 {
-                let value = match read_bytes(&mut reader) {
-                    Ok(v) => v,
+
+            let value = if tag[0] == 0 {
+                match read_bytes(&mut reader) {
+                    Ok(v) => Some(v),
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                     Err(e) => return Err(e),
-                };
-                records.push(WalRecord::Put { key, value });
+                }
             } else {
-                records.push(WalRecord::Delete { key });
+                None
+            };
+
+            // Read stored CRC
+            let mut crc_buf = [0u8; 4];
+            match reader.read_exact(&mut crc_buf) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+            let stored_crc = u32::from_le_bytes(crc_buf);
+
+            // Recompute CRC from the exact bytes that were written
+            let mut payload = vec![tag[0]];
+            payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
+            payload.extend_from_slice(&key);
+            if let Some(ref v) = value {
+                payload.extend_from_slice(&(v.len() as u32).to_be_bytes());
+                payload.extend_from_slice(v);
+            }
+            let computed_crc = crc32fast::hash(&payload);
+
+            if stored_crc != computed_crc {
+                // Bit-rot or torn write detected. Stop here — do not replay
+                // anything further; the bytes after this point are untrustworthy.
+                eprintln!("WAL: CRC mismatch — stopping recovery at corrupt record (recovered {} records before it)", records.len());
+                break;
+            }
+
+            match value {
+                Some(v) => records.push(WalRecord::Put { key, value: v }),
+                None => records.push(WalRecord::Delete { key }),
             }
         }
+
         Ok(records)
     }
 }

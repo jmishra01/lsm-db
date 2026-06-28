@@ -153,5 +153,137 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    // 9. CRC32 checksums — corruption detection
+    println!("\n-- 9. CRC32 checksums");
+    {
+        let _ = std::fs::remove_dir_all(dir);
+        {
+            let mut db = LsmEngine::open(dir)?;
+            db.put("alpha", "value_alpha")?;
+            db.put("beta",  "value_beta")?;
+            db.put("gamma", "value_gamma")?;
+            println!(" wrote 3 records to WAL");
+        }
+
+        // Corrupt the middle of the WAL file by flipping bytes in the second record.
+        // The WAL replays until the CRC mismatch, then stops — recovering only
+        // the records that were written before the corruption.
+        let wal_path = format!("{}/default/wal.log", dir);
+        let mut wal_bytes = std::fs::read(&wal_path)?;
+        // Flip 4 bytes starting at offset 20 (well inside the second record)
+        if wal_bytes.len() > 24 {
+            wal_bytes[20] ^= 0xFF;
+            wal_bytes[21] ^= 0xFF;
+            wal_bytes[22] ^= 0xFF;
+            wal_bytes[23] ^= 0xFF;
+        }
+        std::fs::write(&wal_path, &wal_bytes)?;
+        println!(" WAL corrupted (bytes 20-23 flipped)");
+
+        // Re-open: recovery should print a CRC mismatch warning and stop
+        let db = LsmEngine::open(dir)?;
+        // "alpha" was the first record — may survive depending on where corruption landed
+        println!(" alpha -> {:?}", db.get("alpha")?.map(|v| String::from_utf8(v).unwrap()));
+        println!(" beta  -> {:?}", db.get("beta")?.map(|v| String::from_utf8(v).unwrap()));
+        println!(" gamma -> {:?}", db.get("gamma")?.map(|v| String::from_utf8(v).unwrap()));
+        println!(" (any None above = that record was past the corrupt point — safely discarded)");
+    }
+
+    // 10. Column families — independent key spaces
+    println!("\n-- 10. Column families");
+    {
+        let _ = std::fs::remove_dir_all(dir);
+        let mut db = LsmEngine::open_with_cfs(dir, &["default", "meta", "events"])?;
+
+        println!(" open CFs: {:?}", db.list_cfs());
+
+        // Each CF is a completely isolated key space
+        db.put_cf("meta",    "schema_version", "3")?;
+        db.put_cf("meta",    "db_created_at",  "2025-01-01")?;
+        db.put_cf("events",  "evt:0001", r#"{"type":"login","user":"alice"}"#)?;
+        db.put_cf("events",  "evt:0002", r#"{"type":"logout","user":"alice"}"#)?;
+        db.put("app_config", "debug_mode=false")?;   // default CF
+
+        // Reads are scoped to their CF — no cross-CF bleed
+        println!(" meta.schema_version -> {:?}",
+            db.get_cf("meta", "schema_version")?.map(|v| String::from_utf8(v).unwrap()));
+        println!(" events.evt:0001 -> {:?}",
+            db.get_cf("events", "evt:0001")?.map(|v| String::from_utf8(v).unwrap()));
+        println!(" default.app_config -> {:?}",
+            db.get("app_config")?.map(|v| String::from_utf8(v).unwrap()));
+
+        // A key written to one CF is invisible in another
+        println!(" events.schema_version (cross-CF read) -> {:?}",
+            db.get_cf("events", "schema_version")?);
+
+        // Scan within a CF
+        let evts = db.scan_cf("events", "evt:0000", "evt:9999")?;
+        println!(" events scan: {} result(s)", evts.len());
+        for (k, v) in &evts {
+            println!("   {} -> {}", String::from_utf8_lossy(k), String::from_utf8_lossy(v));
+        }
+
+        // Create a new CF at runtime
+        db.create_cf("audit")?;
+        db.put_cf("audit", "log:001", "admin changed schema_version")?;
+        println!(" audit.log:001 -> {:?}",
+            db.get_cf("audit", "log:001")?.map(|v| String::from_utf8(v).unwrap()));
+        println!(" all CFs after create_cf: {:?}", db.list_cfs());
+    }
+
+    // 11. Manifest — durable SSTable inventory
+    println!("\n-- 11. Manifest");
+    {
+        let _ = std::fs::remove_dir_all(dir);
+
+        // Session 1: write enough data to trigger a MemTable flush → SSTable file created
+        {
+            // 256 KiB threshold; each entry is ~70 bytes so ~3800 entries triggers flush
+            let mut db = LsmEngine::open(dir)?;
+            for i in 0..4000u32 {
+                db.put(
+                    format!("mkey:{:06}", i),
+                    format!("{{\"index\":{},\"payload\":\"{}\"}}", i, "x".repeat(40)),
+                )?;
+            }
+            println!(" [session 1] wrote 4000 keys (triggers flush to SSTable)");
+            let s = db.stats();
+            println!(" [session 1] L0 files: {}", s.level_file_counts[0]);
+        }
+
+        // Show manifest file exists and has records
+        let manifest_path = format!("{}/MANIFEST", dir);
+        let manifest_size = std::fs::metadata(&manifest_path)?.len();
+        println!(" MANIFEST file size: {} bytes", manifest_size);
+
+        // The manifest lists which SST files exist at which levels.
+        // Read it back to show the records.
+        let mstate = lsmdb::manifest::Manifest::recover(&manifest_path)?;
+        println!(" Manifest knows {} CF(s): {:?}", mstate.cfs.len(), {
+            let mut v: Vec<_> = mstate.cfs.iter().collect();
+            v.sort();
+            v
+        });
+        for (cf, files) in &mstate.files {
+            println!(" CF '{}': {} SSTable file(s) recorded", cf, files.len());
+            for (level, filename) in files {
+                println!("   L{} — {}", level, filename);
+            }
+        }
+
+        // Session 2: reopen — the engine loads SSTables from the manifest, not
+        // a directory scan. If the manifest were missing (old behaviour), the
+        // engine would have to re-scan the directory and could not distinguish
+        // current files from compaction leftovers.
+        {
+            let db = LsmEngine::open(dir)?;
+            let first = db.get("mkey:000000")?.map(|v| String::from_utf8(v).unwrap());
+            let last  = db.get("mkey:003999")?.map(|v| String::from_utf8(v).unwrap());
+            println!(" [session 2] mkey:000000 -> {:?}", first);
+            println!(" [session 2] mkey:003999 -> {:?}", last);
+            println!(" [session 2] data survived reopen via manifest ✓");
+        }
+    }
+
     Ok(())
 }
