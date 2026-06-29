@@ -32,7 +32,16 @@
     - [#11 HTTP API](#11-http-api)
     - [#12 Replication](#12-replication)
     - [#13 Benchmark Suite](#13-benchmark-suite)
-12. [Further Reading](#12-further-reading)
+12. [Advanced Features](#12-advanced-features)
+    - [TTL / Key Expiry](#ttl--key-expiry)
+    - [Range Deletion](#range-deletion)
+    - [Compaction Filter](#compaction-filter)
+    - [WAL Group Commit](#wal-group-commit)
+    - [Merge Operator](#merge-operator)
+    - [Optimistic Concurrency Control (OCC)](#optimistic-concurrency-control-occ)
+    - [Snapshot Garbage Collection](#snapshot-garbage-collection)
+    - [Metrics + Async API](#metrics--async-api)
+13. [Further Reading](#13-further-reading)
 
 ---
 
@@ -794,25 +803,32 @@ post-dates the snapshot.
 cargo run
 ```
 
-The demo exercises all 14 major features:
+The demo exercises all 22 sections:
 
 | Section | Feature |
 |---------|---------|
-| 1 | Basic put / get |
-| 2 | Overwrite (latest write wins) |
-| 3 | Delete / tombstone |
-| 4 | Range scan |
-| 5 | High-volume write (1000 keys, triggers compaction path) |
-| 6 | Persistence across reopen (WAL recovery) |
-| 7 | Engine stats |
-| 8 | Concurrent reads via `SharedLsmEngine` (4 threads) |
-| 9 | CRC32 corruption detection in the WAL |
+| 1  | Basic put / get |
+| 2  | Overwrite (latest write wins) |
+| 3  | Delete / tombstone |
+| 4  | Range scan |
+| 5  | High-volume write (1 000 keys, triggers compaction) |
+| 6  | Persistence across reopen (WAL recovery) |
+| 7  | Engine stats |
+| 8  | Concurrent reads via `SharedLsmEngine` (4 threads) |
+| 9  | CRC32 corruption detection in the WAL |
 | 10 | Column families — independent key spaces |
 | 11 | Manifest — durable SSTable inventory |
 | 12 | **Iterator / Cursor API** — merge-heap over MemTable + SSTables |
 | 13 | **Prefix scans** — hierarchical key spaces |
 | 14 | **Snapshots + WriteBatch** — MVCC with seq numbers |
 | 15 | **HTTP API** — axum router wrapping `SharedLsmEngine` |
+| 16 | **TTL / Key Expiry** — keys expire after a configurable duration |
+| 17 | **Range Deletion** — atomically delete all keys in `[from, to)` |
+| 18 | **Compaction Filter** — drop / replace entries at merge time |
+| 19 | **Merge Operator** — lock-free counter and string-append |
+| 20 | **OCC Transactions** — optimistic conflict detection at commit |
+| 21 | **Snapshot GC** — prune redundant old versions safely |
+| 22 | **Metrics** — Prometheus counters and latency histograms |
 
 ---
 
@@ -953,7 +969,340 @@ Criterion writes HTML reports to `target/criterion/`.
 
 ---
 
-## 12. Further Reading
+## 12. Advanced Features
+
+### TTL / Key Expiry
+
+**File:** `src/memtable.rs`, `src/wal.rs`, `src/engine.rs`
+
+Every entry can carry an `expires_at` Unix-millisecond timestamp. Reads return `None` for expired keys instantly; compaction filters physically reclaim the space.
+
+#### Why TTL matters
+
+Without TTL you must implement expiry at the application layer: read the key, check a timestamp field, delete it. Under load this becomes a separate read + write for every expiry. TTL bakes expiry into the storage layer — zero extra reads, zero application logic.
+
+Real uses: session stores, lease tokens, rate-limit counters, cache entries.
+
+```rust
+// Key expires in 5 minutes
+db.put_with_ttl("session:abc123", "uid=42", 5 * 60 * 1000)?;
+
+// After 5 minutes, reads return None automatically
+assert_eq!(db.get("session:abc123")?, None);
+```
+
+#### Wire format extension
+
+TTL adds WAL opcode `0x02` (vs `0x00` for plain Put):
+```
+[0x02][key_len:4][key][seq:8 LE][expires_at:8 LE][val_len:4][val][crc32:4]
+```
+On recovery the `expires_at` is restored exactly, so TTL semantics survive crashes.
+
+---
+
+### Range Deletion
+
+**File:** `src/wal.rs`, `src/engine.rs`
+
+Delete all keys in `[from, to)` with a single call and a single WAL record.
+
+#### Why a dedicated range delete?
+
+Deleting N keys individually writes N WAL records and N tombstones to the MemTable. A range delete writes **one** WAL record and is O(k) in the number of matching MemTable keys, not O(N) in the key space. This is critical for log rotation, partition pruning, and time-series eviction.
+
+```rust
+// Atomically delete log:0003 through log:0006 (4 keys)
+db.delete_range("log:0003", "log:0007")?;
+```
+
+WAL opcode `0x03`:
+```
+[0x03][from_len:4][from][to_len:4][to][seq:8 LE][crc32:4]
+```
+
+---
+
+### Compaction Filter
+
+**File:** `src/compaction_filter.rs`
+
+A user-supplied closure invoked on every live entry during an SSTable merge. The filter decides to **Keep**, **Replace**, or **Remove** the entry.
+
+#### Why compaction filters?
+
+TTL can expire keys at read time, but the physical bytes stay on disk until compaction. A compaction filter is the only mechanism that actually reclaims disk space at merge time — without any read overhead on the hot path.
+
+```rust
+use lsmdb::compaction_filter::{FnFilter, FilterDecision, apply_filter};
+
+let filter = FnFilter::new("drop_temp", |key: &[u8], _val: &[u8]| {
+    if key.starts_with(b"temp:") { FilterDecision::Remove }
+    else { FilterDecision::Keep }
+});
+
+let cleaned = apply_filter(entries, &filter);
+```
+
+Built-in filters:
+- `ExpiryPrefixFilter` — drops entries whose first 8 bytes encode an expired Unix-ms timestamp
+- `PrefixDropFilter` — drops all keys under a given prefix
+- `FnFilter<F>` — closure-based, for arbitrary logic
+
+#### How to wire it into compaction
+
+```rust
+let entries = merge_entries(l0_entries, l1_entries, false);
+let entries = apply_filter(entries, &my_filter); // ← insert after merge
+let sst = write_merged(output_path, entries, target_level)?;
+```
+
+---
+
+### WAL Group Commit
+
+**File:** `src/group_commit.rs`
+
+Batches concurrent WAL writes into a single `fsync`, reducing I/O from O(N writers) to O(1) per time window.
+
+#### The problem
+
+Every `put_cf` calls `WAL.flush()` synchronously. Under N concurrent writers that is N fsyncs per N writes — the single biggest latency source on any disk, even NVMe (a single fsync ≈ 20–200 µs).
+
+#### The solution: elected-leader batch
+
+```
+Writer A ─┐                       ┌─ woken, returns Ok
+Writer B ─┼── lock batch ──────── ┤
+Writer C ─┘   leader elected      ├─ woken, returns Ok
+              drains A+B+C        └─ woken, returns Ok
+              single fsync ──────────────────────────▶
+```
+
+1. Each writer appends its record to a shared `Vec` and parks.
+2. The first writer to acquire the write lock becomes the **leader**.
+3. The leader drains the batch, writes all records, issues one `fsync`.
+4. The leader increments a `generation` counter and wakes all parked followers.
+5. Followers see `generation > their_captured_generation` and return immediately.
+
+```rust
+use lsmdb::GroupCommitWal;
+
+let wal = GroupCommitWal::open("/data/mydb/default/wal.log")?;
+// Safe to call from many threads simultaneously — one fsync per batch
+wal.submit(WalRecord::Put { key, seq, value })?;
+```
+
+This is how PostgreSQL's WAL writer, MySQL's binary log group commit, and RocksDB's write pipeline all work.
+
+---
+
+### Merge Operator
+
+**File:** `src/merge_operator.rs`
+
+Allows **delta writes** — append a change without reading the current value first.
+
+#### The read-modify-write problem
+
+```rust
+// Naive counter increment — requires a read:
+let n = db.get("hits")?.map(|v| i64::from_le_bytes(v.try_into().unwrap())).unwrap_or(0);
+db.put("hits", (n + 1).to_le_bytes())?;
+```
+
+Under concurrency this is a data race. Serialising it with a lock limits throughput to one increment per lock round-trip.
+
+#### Merge operators: write the delta, resolve later
+
+```rust
+use lsmdb::merge_operator::{Int64AddOperator, MergeOperator, MergeState, MergeDelta};
+
+let op = Int64AddOperator;
+let mut state = MergeState::new();
+
+// Three writers append +1, +1, +5 without reading
+for delta in [1i64, 1, 5] {
+    state.push(MergeDelta { key: b"hits".to_vec(), seq: 0, delta: delta.to_le_bytes().to_vec() });
+}
+
+// Resolve on read (or during compaction)
+let result_bytes = state.resolve(b"hits", None, &op).unwrap();
+let result = i64::from_le_bytes(result_bytes.try_into().unwrap()); // 7
+```
+
+Built-in operators:
+| Operator | Delta format | Use case |
+|----------|-------------|---------|
+| `Int64AddOperator` | `i64` LE | Atomic counters, gauges |
+| `StringAppendOperator` | raw bytes | Tag lists, audit logs |
+
+Custom operators implement the `MergeOperator` trait:
+```rust
+fn full_merge(&self, key: &[u8], base: Option<&[u8]>, deltas: &[Vec<u8>]) -> Option<Vec<u8>>;
+fn partial_merge(&self, key: &[u8], left: &[u8], right: &[u8]) -> Option<Vec<u8>>;
+```
+
+---
+
+### Optimistic Concurrency Control (OCC)
+
+**File:** `src/occ.rs`
+
+Read-validate-write transactions without locks. Writers proceed optimistically; conflicts are detected at commit time.
+
+#### How it works
+
+1. **Begin** — record `read_horizon = current write_seq`.
+2. **Read** — via a snapshot pinned at `read_horizon`; add each key to the `read_set`.
+3. **Modify** — buffer mutations locally (nothing goes to disk yet).
+4. **Commit** — for each key in `read_set`, check that its `write_seq` has not advanced past `read_horizon`. If clean → atomically apply as a `WriteBatch`. If dirty → return `Err(OccError::Conflict)`.
+
+```rust
+use lsmdb::occ::{OccTransaction, OccError};
+
+loop {
+    let mut tx = OccTransaction::begin(&db)?;
+
+    let balance = tx.get(b"balance:alice")
+        .and_then(|v| String::from_utf8(v).ok())
+        .unwrap_or_default();
+
+    tx.put(b"balance:alice".to_vec(), b"900".to_vec());
+
+    match tx.commit(&mut db) {
+        Ok(())                     => break,
+        Err(OccError::Conflict(_)) => continue, // retry
+        Err(OccError::Io(e))       => return Err(e.into()),
+    }
+}
+```
+
+#### Trade-offs
+
+| | OCC (this) | Locking (pessimistic) |
+|---|---|---|
+| **Throughput** | High under low conflict | Constant regardless of conflicts |
+| **Deadlocks** | Impossible | Possible |
+| **Abort rate** | High under hot contention | Zero |
+| **Implementation** | Simple seq comparison | Requires lock manager |
+
+---
+
+### Snapshot Garbage Collection
+
+**File:** `src/snapshot_gc.rs`
+
+Tracks live snapshots and prunes unreachable old versions of keys during compaction.
+
+#### The problem
+
+With MVCC, every write produces a new version:
+
+```
+key:a  seq=5  → "v1"
+key:a  seq=15 → "v2"   ← overwrites v1
+key:a  seq=25 → "v3"   ← overwrites v2
+```
+
+A compaction that merges these sees three entries. Standard logic only drops the tombstone at the deepest level. Versions `seq=5` and `seq=15` are kept even when no snapshot will ever need them — they waste disk space indefinitely.
+
+#### The solution: safe horizon
+
+```
+active snapshots: {seq=10, seq=20}
+safe horizon = min(active) - 1 = 9
+```
+
+Any version of a key with `seq ≤ 9` **and** a newer version existing can be dropped immediately — no snapshot can see it.
+
+```rust
+use lsmdb::snapshot_gc::{SnapshotRegistry, filter_versions};
+
+let registry = SnapshotRegistry::new();
+let _guard = registry.register(10); // snapshot lives as long as the guard
+
+// In compaction:
+let pruned = filter_versions(merged_entries, registry.safe_horizon(), at_deepest_level);
+```
+
+The `SnapshotGuard` unregisters automatically on `drop`, so the horizon advances as snapshots are released — preventing indefinite version accumulation.
+
+---
+
+### Metrics + Async API
+
+#### Metrics (`src/metrics.rs`)
+
+Zero-dependency Prometheus-compatible metrics with atomic counters and power-of-2 latency histograms.
+
+```rust
+use lsmdb::Metrics;
+
+let m = Metrics::new(); // Arc<Metrics>
+m.record_write(key_bytes + val_bytes, elapsed_ns);
+m.record_read(hit, val_bytes, elapsed_ns);
+m.record_compaction(duration_ns);
+m.record_bloom(hit);
+
+// Emit Prometheus text format — wire to GET /metrics
+println!("{}", m.prometheus());
+```
+
+Tracked metrics:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `lsmdb_writes_total` | counter | Total put/delete calls |
+| `lsmdb_reads_total` | counter | Total get calls |
+| `lsmdb_read_hits_total` | counter | Gets that found a value |
+| `lsmdb_compactions_total` | counter | Completed compaction jobs |
+| `lsmdb_bloom_hits_total` | counter | Bloom filter true positives |
+| `lsmdb_bloom_misses_total` | counter | Bloom filter true negatives (disk I/O saved) |
+| `lsmdb_write_bytes_total` | counter | Bytes written (key + value) |
+| `lsmdb_read_bytes_total` | counter | Bytes read (value only) |
+| `lsmdb_write_latency_ns` | histogram | Write call latency distribution |
+| `lsmdb_read_latency_ns` | histogram | Read call latency distribution |
+| `lsmdb_compact_latency_ns` | histogram | Compaction job latency distribution |
+
+The `GET /metrics` endpoint in the HTTP API serves this output in Prometheus text format (scrape-able by any Prometheus server).
+
+#### Async API (`src/async_engine.rs`)
+
+`AsyncEngine` wraps `SharedLsmEngine` and offloads every blocking call to `tokio::task::spawn_blocking`, making the API fully compatible with `.await`.
+
+```rust
+use lsmdb::AsyncEngine;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let db = AsyncEngine::open("/data/mydb").await?;
+
+    db.put("sensor:001", "23.5°C").await?;
+    db.put_with_ttl("cache:key", "value", 60_000).await?; // 1-minute TTL
+
+    let v = db.get("sensor:001").await?;
+    let results = db.scan_prefix(b"sensor:".to_vec()).await?;
+
+    let mut batch = WriteBatch::new();
+    batch.put("default", "a", "1").put("default", "b", "2");
+    db.write_batch(batch).await?;
+
+    Ok(())
+}
+```
+
+**When to use which API:**
+
+| API | Best for |
+|-----|---------|
+| `LsmEngine` | Single-threaded tools, scripts, tests |
+| `SharedLsmEngine` | Multi-threaded sync code, CLI, benchmarks |
+| `AsyncEngine` | Tokio servers, the HTTP API, high-concurrency I/O |
+
+---
+
+## 13. Further Reading
 
 | Resource | Why read it |
 |---|---|

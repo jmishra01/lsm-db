@@ -183,12 +183,17 @@ impl ReplicationClient {
             let record = WalRecord::decode_frame(&frame)?;
             match record {
                 WalRecord::Put { key, value, .. } => {
-                    self.db.put_cf(&self.cf, key, value)
-                        .map_err(io::Error::other)?;
+                    self.db.put_cf(&self.cf, key, value).map_err(io::Error::other)?;
+                }
+                WalRecord::PutTtl { key, value, .. } => {
+                    // Replicate value only; TTL semantics are leader-local.
+                    self.db.put_cf(&self.cf, key, value).map_err(io::Error::other)?;
                 }
                 WalRecord::Delete { key, .. } => {
-                    self.db.delete_cf(&self.cf, key)
-                        .map_err(io::Error::other)?;
+                    self.db.delete_cf(&self.cf, key).map_err(io::Error::other)?;
+                }
+                WalRecord::DeleteRange { from, to, .. } => {
+                    self.db.delete_range_cf(&self.cf, from, to).map_err(io::Error::other)?;
                 }
             }
         }

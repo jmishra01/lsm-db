@@ -156,9 +156,22 @@ impl LsmEngine {
                         if seq > max_write_seq { max_write_seq = seq; }
                         mem.put_seq(key, value, seq);
                     }
+                    WalRecord::PutTtl { key, seq, value, expires_at } => {
+                        if seq > max_write_seq { max_write_seq = seq; }
+                        mem.put_seq_ttl(key, value, seq, expires_at);
+                    }
                     WalRecord::Delete { key, seq } => {
                         if seq > max_write_seq { max_write_seq = seq; }
                         mem.delete_seq(key, seq);
+                    }
+                    WalRecord::DeleteRange { from, to, seq } => {
+                        // Replay range deletion: delete every key in [from, to)
+                        if seq > max_write_seq { max_write_seq = seq; }
+                        let keys_in_range: Vec<Vec<u8>> = mem.iter()
+                            .filter(|(k, _)| k.as_slice() >= from.as_slice() && k.as_slice() < to.as_slice())
+                            .map(|(k, _)| k.clone())
+                            .collect();
+                        for k in keys_in_range { mem.delete_seq(k, seq); }
                     }
                 }
             }
@@ -262,12 +275,73 @@ impl LsmEngine {
         self.maybe_flush_and_compact(cf)
     }
 
+    /// Insert a key that expires after `ttl_ms` milliseconds.
+    /// After expiry, reads return None and the entry is dropped during compaction.
+    pub fn put_with_ttl(
+        &mut self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+        ttl_ms: u64,
+    ) -> io::Result<()> {
+        self.put_with_ttl_cf("default", key, value, ttl_ms)
+    }
+
+    pub fn put_with_ttl_cf(
+        &mut self,
+        cf: &str,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+        ttl_ms: u64,
+    ) -> io::Result<()> {
+        use crate::memtable::now_ms;
+        let key = key.into();
+        let value = value.into();
+        let expires_at = if ttl_ms == 0 { 0 } else { now_ms() + ttl_ms };
+        let seq = self.write_seq.fetch_add(1, Ordering::SeqCst);
+        let cf_state = self.cf_mut(cf)?;
+        cf_state.wal.append_put_ttl(key.clone(), seq, value.clone(), expires_at)?;
+        cf_state.mem.put_seq_ttl(key, value, seq, expires_at);
+        self.maybe_flush_and_compact(cf)
+    }
+
     pub fn delete_cf(&mut self, cf: &str, key: impl Into<Vec<u8>>) -> io::Result<()> {
         let key = key.into();
         let seq = self.write_seq.fetch_add(1, Ordering::SeqCst);
         let cf_state = self.cf_mut(cf)?;
         cf_state.wal.append_delete(key.clone(), seq)?;
         cf_state.mem.delete_seq(key, seq);
+        self.maybe_flush_and_compact(cf)
+    }
+
+    /// Delete all keys in the range [from, to) atomically.
+    /// A single WAL record is written; during a cursor scan, keys in the range whose
+    /// write_seq ≤ range_seq are hidden.  SSTable compaction drops them entirely
+    /// when the range tombstone reaches the deepest level.
+    pub fn delete_range(
+        &mut self,
+        from: impl Into<Vec<u8>>,
+        to: impl Into<Vec<u8>>,
+    ) -> io::Result<()> {
+        self.delete_range_cf("default", from, to)
+    }
+
+    pub fn delete_range_cf(
+        &mut self,
+        cf: &str,
+        from: impl Into<Vec<u8>>,
+        to: impl Into<Vec<u8>>,
+    ) -> io::Result<()> {
+        let from = from.into();
+        let to   = to.into();
+        let seq  = self.write_seq.fetch_add(1, Ordering::SeqCst);
+        let cf_state = self.cf_mut(cf)?;
+        cf_state.wal.append_delete_range(from.clone(), to.clone(), seq)?;
+        // Delete every matching key currently in the MemTable.
+        let keys: Vec<Vec<u8>> = cf_state.mem.iter()
+            .filter(|(k, _)| k.as_slice() >= from.as_slice() && k.as_slice() < to.as_slice())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys { cf_state.mem.delete_seq(k, seq); }
         self.maybe_flush_and_compact(cf)
     }
 
@@ -413,6 +487,41 @@ impl LsmEngine {
         Ok(Snapshot::new(snapshot_seq, data))
     }
 
+    // -- Internal helpers used by OCC and metrics
+
+    /// Current value of the write_seq counter.  Used by OCC to capture
+    /// the read horizon at transaction start.
+    pub fn write_seq(&self) -> u64 {
+        self.write_seq.load(Ordering::SeqCst)
+    }
+
+    /// Return the write_seq of the most recent version of `key` in `cf`,
+    /// or None if the key does not exist (including tombstones).
+    /// Used by OCC to detect write-write conflicts.
+    pub fn key_write_seq(&self, cf: &str, key: &[u8]) -> io::Result<Option<u64>> {
+        let cf_state = self.cf(cf)?;
+        // Check active MemTable
+        if let Some(entry) = cf_state.mem.iter().find(|(k, _)| k.as_slice() == key) {
+            return Ok(Some((entry.1).0));
+        }
+        // Check immutable MemTables (newest first)
+        for imm in cf_state.imm.iter().rev() {
+            if let Some(entry) = imm.iter().find(|(k, _)| k.as_slice() == key) {
+                return Ok(Some((entry.1).0));
+            }
+        }
+        // Check SSTables
+        for level in &cf_state.levels {
+            for sst in level.iter().rev() {
+                match sst.get(key, u64::MAX, Some(&self.cache))? {
+                    Some(_) => return Ok(Some(sst.max_write_seq)),
+                    None    => {}
+                }
+            }
+        }
+        Ok(None)
+    }
+
     // -- Stats
 
     pub fn stats(&self) -> Stats {
@@ -464,17 +573,18 @@ impl LsmEngine {
             Vec::new();
 
         // Active MemTable — clone data so the cursor outlives the borrow
+        let now = crate::memtable::now_ms();
         let mem_entries: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = cf_state.mem.iter()
-            .filter(|(_, (seq, _))| *seq <= max_seq)
-            .map(|(k, (seq, v))| (k.clone(), *seq, v.clone()))
+            .filter(|(_, (seq, exp, _))| *seq <= max_seq && (*exp == 0 || now < *exp))
+            .map(|(k, (seq, _, v))| (k.clone(), *seq, v.clone()))
             .collect();
         sources.push(Box::new(mem_entries.into_iter()));
 
         // Immutable MemTables, newest first (imm is appended; last = newest)
         for imm in cf_state.imm.iter().rev() {
             let entries: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = imm.iter()
-                .filter(|(_, (seq, _))| *seq <= max_seq)
-                .map(|(k, (seq, v))| (k.clone(), *seq, v.clone()))
+                .filter(|(_, (seq, exp, _))| *seq <= max_seq && (*exp == 0 || now < *exp))
+                .map(|(k, (seq, _, v))| (k.clone(), *seq, v.clone()))
                 .collect();
             sources.push(Box::new(entries.into_iter()));
         }
@@ -783,6 +893,18 @@ impl SharedLsmEngine {
     }
     pub fn scan_prefix_cf(&self, cf: &str, prefix: impl AsRef<[u8]>) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.0.read().unwrap().scan_prefix_cf(cf, prefix)
+    }
+    pub fn put_with_ttl(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>, ttl_ms: u64) -> io::Result<()> {
+        self.0.write().unwrap().put_with_ttl(key, value, ttl_ms)
+    }
+    pub fn put_with_ttl_cf(&self, cf: &str, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>, ttl_ms: u64) -> io::Result<()> {
+        self.0.write().unwrap().put_with_ttl_cf(cf, key, value, ttl_ms)
+    }
+    pub fn delete_range(&self, from: impl Into<Vec<u8>>, to: impl Into<Vec<u8>>) -> io::Result<()> {
+        self.0.write().unwrap().delete_range(from, to)
+    }
+    pub fn delete_range_cf(&self, cf: &str, from: impl Into<Vec<u8>>, to: impl Into<Vec<u8>>) -> io::Result<()> {
+        self.0.write().unwrap().delete_range_cf(cf, from, to)
     }
     pub fn write_batch(&self, batch: WriteBatch) -> io::Result<()> {
         self.0.write().unwrap().write_batch(batch)

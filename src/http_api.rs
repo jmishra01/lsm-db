@@ -21,24 +21,31 @@
 use axum::{
     Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+use crate::metrics::Metrics;
 use crate::SharedLsmEngine;
 
 // ---- shared state ----------------------------------------------------------
 
 #[derive(Clone)]
 pub struct AppState {
-    db: SharedLsmEngine,
+    db:      SharedLsmEngine,
+    metrics: Arc<Metrics>,
 }
 
 impl AppState {
     pub fn new(db: SharedLsmEngine) -> Self {
-        Self { db }
+        Self { db, metrics: Metrics::new() }
+    }
+
+    pub fn with_metrics(db: SharedLsmEngine, metrics: Arc<Metrics>) -> Self {
+        Self { db, metrics }
     }
 }
 
@@ -165,6 +172,13 @@ async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let body = state.metrics.prometheus();
+    let mut headers = HeaderMap::new();
+    headers.insert("Content-Type", HeaderValue::from_static("text/plain; version=0.0.4"));
+    (StatusCode::OK, headers, body)
+}
+
 // ---- router factory --------------------------------------------------------
 
 /// Build and return the axum Router.  Caller binds it to a TcpListener.
@@ -185,5 +199,6 @@ pub fn make_router(db: SharedLsmEngine) -> Router {
         .route("/prefix/{prefix}", get(scan_prefix_handler))
         .route("/snapshot",     get(snapshot_handler))
         .route("/stats",        get(stats_handler))
+        .route("/metrics",      get(metrics_handler))
         .with_state(state)
 }

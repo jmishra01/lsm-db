@@ -33,8 +33,11 @@ use std::path::Path;
 
 #[derive(Debug)]
 pub enum WalRecord {
-    Put { key: Vec<u8>, seq: u64, value: Vec<u8> },
+    Put    { key: Vec<u8>, seq: u64, value: Vec<u8> },
+    PutTtl { key: Vec<u8>, seq: u64, value: Vec<u8>, expires_at: u64 },
     Delete { key: Vec<u8>, seq: u64 },
+    /// Tombstone covering all keys in [from, to) — range deletion (#new).
+    DeleteRange { from: Vec<u8>, to: Vec<u8>, seq: u64 },
 }
 
 pub struct Wal {
@@ -61,11 +64,46 @@ impl Wal {
         self.writer.flush()
     }
 
+    /// Like `append_put` but also stores an expiry timestamp (Unix-ms).
+    /// Wire opcode 0x02; format:
+    ///   [0x02][key_len:4][key][seq:8 LE][expires_at:8 LE][val_len:4][val][crc32:4]
+    pub fn append_put_ttl(&mut self, key: Vec<u8>, seq: u64, value: Vec<u8>, expires_at: u64) -> io::Result<()> {
+        let mut payload = Vec::with_capacity(1 + 4 + key.len() + 8 + 8 + 4 + value.len());
+        payload.push(0x02u8);
+        payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&key);
+        payload.extend_from_slice(&seq.to_le_bytes());
+        payload.extend_from_slice(&expires_at.to_le_bytes());
+        payload.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&value);
+        let crc = crc32fast::hash(&payload);
+        self.writer.write_all(&payload)?;
+        self.writer.write_all(&crc.to_le_bytes())?;
+        self.writer.flush()
+    }
+
     pub fn append_delete(&mut self, key: Vec<u8>, seq: u64) -> io::Result<()> {
         let mut payload = Vec::with_capacity(1 + 4 + key.len() + 8);
         payload.push(1u8);
         payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
         payload.extend_from_slice(&key);
+        payload.extend_from_slice(&seq.to_le_bytes());
+        let crc = crc32fast::hash(&payload);
+        self.writer.write_all(&payload)?;
+        self.writer.write_all(&crc.to_le_bytes())?;
+        self.writer.flush()
+    }
+
+    /// Write a range-deletion tombstone covering [from, to).
+    /// Wire opcode 0x03:
+    ///   [0x03][from_len:4][from][to_len:4][to][seq:8 LE][crc32:4]
+    pub fn append_delete_range(&mut self, from: Vec<u8>, to: Vec<u8>, seq: u64) -> io::Result<()> {
+        let mut payload = Vec::with_capacity(1 + 4 + from.len() + 4 + to.len() + 8);
+        payload.push(0x03u8);
+        payload.extend_from_slice(&(from.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&from);
+        payload.extend_from_slice(&(to.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&to);
         payload.extend_from_slice(&seq.to_le_bytes());
         let crc = crc32fast::hash(&payload);
         self.writer.write_all(&payload)?;
@@ -83,7 +121,6 @@ impl Wal {
         let mut records = Vec::new();
 
         loop {
-            // Tag byte — clean EOF here means we're done
             let mut tag = [0u8; 1];
             match reader.read_exact(&mut tag) {
                 Ok(_) => {}
@@ -91,62 +128,72 @@ impl Wal {
                 Err(e) => return Err(e),
             }
 
-            let key = match read_bytes(&mut reader) {
-                Ok(k) => k,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            };
+            macro_rules! read_or_break {
+                ($expr:expr) => {
+                    match $expr {
+                        Ok(v) => v,
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(e),
+                    }
+                };
+            }
 
-            // Sequence number (8 bytes LE) follows the key
-            let seq = match read_u64_le(&mut reader) {
-                Ok(s) => s,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            };
-
-            let value = if tag[0] == 0 {
-                match read_bytes(&mut reader) {
-                    Ok(v) => Some(v),
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e),
+            let record = match tag[0] {
+                0x00 => {
+                    // Put: [key][seq:8][val_len:4][val][crc:4]
+                    let key   = read_or_break!(read_bytes(&mut reader));
+                    let seq   = read_or_break!(read_u64_le(&mut reader));
+                    let value = read_or_break!(read_bytes(&mut reader));
+                    let crc   = read_or_break!(read_u32_le(&mut reader));
+                    let mut p = vec![0x00u8];
+                    p.extend_from_slice(&(key.len() as u32).to_be_bytes()); p.extend_from_slice(&key);
+                    p.extend_from_slice(&seq.to_le_bytes());
+                    p.extend_from_slice(&(value.len() as u32).to_be_bytes()); p.extend_from_slice(&value);
+                    if crc32fast::hash(&p) != crc { break; }
+                    WalRecord::Put { key, seq, value }
                 }
-            } else {
-                None
+                0x01 => {
+                    // Delete: [key][seq:8][crc:4]
+                    let key = read_or_break!(read_bytes(&mut reader));
+                    let seq = read_or_break!(read_u64_le(&mut reader));
+                    let crc = read_or_break!(read_u32_le(&mut reader));
+                    let mut p = vec![0x01u8];
+                    p.extend_from_slice(&(key.len() as u32).to_be_bytes()); p.extend_from_slice(&key);
+                    p.extend_from_slice(&seq.to_le_bytes());
+                    if crc32fast::hash(&p) != crc { break; }
+                    WalRecord::Delete { key, seq }
+                }
+                0x02 => {
+                    // PutTtl: [key][seq:8][expires_at:8][val_len:4][val][crc:4]
+                    let key        = read_or_break!(read_bytes(&mut reader));
+                    let seq        = read_or_break!(read_u64_le(&mut reader));
+                    let expires_at = read_or_break!(read_u64_le(&mut reader));
+                    let value      = read_or_break!(read_bytes(&mut reader));
+                    let crc        = read_or_break!(read_u32_le(&mut reader));
+                    let mut p = vec![0x02u8];
+                    p.extend_from_slice(&(key.len() as u32).to_be_bytes()); p.extend_from_slice(&key);
+                    p.extend_from_slice(&seq.to_le_bytes());
+                    p.extend_from_slice(&expires_at.to_le_bytes());
+                    p.extend_from_slice(&(value.len() as u32).to_be_bytes()); p.extend_from_slice(&value);
+                    if crc32fast::hash(&p) != crc { break; }
+                    WalRecord::PutTtl { key, seq, value, expires_at }
+                }
+                0x03 => {
+                    // DeleteRange: [from_len:4][from][to_len:4][to][seq:8][crc:4]
+                    let from = read_or_break!(read_bytes(&mut reader));
+                    let to   = read_or_break!(read_bytes(&mut reader));
+                    let seq  = read_or_break!(read_u64_le(&mut reader));
+                    let crc  = read_or_break!(read_u32_le(&mut reader));
+                    let mut p = vec![0x03u8];
+                    p.extend_from_slice(&(from.len() as u32).to_be_bytes()); p.extend_from_slice(&from);
+                    p.extend_from_slice(&(to.len() as u32).to_be_bytes()); p.extend_from_slice(&to);
+                    p.extend_from_slice(&seq.to_le_bytes());
+                    if crc32fast::hash(&p) != crc { break; }
+                    WalRecord::DeleteRange { from, to, seq }
+                }
+                _ => { eprintln!("WAL: unknown opcode 0x{:02x}, stopping", tag[0]); break; }
             };
-
-            // Read stored CRC
-            let mut crc_buf = [0u8; 4];
-            match reader.read_exact(&mut crc_buf) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
-            let stored_crc = u32::from_le_bytes(crc_buf);
-
-            // Recompute CRC from the exact bytes that were written
-            let mut payload = vec![tag[0]];
-            payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
-            payload.extend_from_slice(&key);
-            payload.extend_from_slice(&seq.to_le_bytes());
-            if let Some(ref v) = value {
-                payload.extend_from_slice(&(v.len() as u32).to_be_bytes());
-                payload.extend_from_slice(v);
-            }
-            let computed_crc = crc32fast::hash(&payload);
-
-            if stored_crc != computed_crc {
-                eprintln!(
-                    "WAL: CRC mismatch — stopping recovery at corrupt record \
-                     (recovered {} records before it)",
-                    records.len()
-                );
-                break;
-            }
-
-            match value {
-                Some(v) => records.push(WalRecord::Put { key, seq, value: v }),
-                None    => records.push(WalRecord::Delete { key, seq }),
-            }
+            records.push(record);
         }
 
         Ok(records)
@@ -269,4 +316,10 @@ fn read_u64_le(r: &mut impl Read) -> io::Result<u64> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
+}
+
+fn read_u32_le(r: &mut impl Read) -> io::Result<u32> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
 }

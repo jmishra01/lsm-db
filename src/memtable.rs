@@ -25,11 +25,18 @@
 // ==========================================================
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A MemTable entry: (write_seq, value_opt).
-/// write_seq is the global monotonic sequence number assigned at write time.
-/// value_opt is Some(bytes) for a live key, None for a tombstone.
-pub type MemEntry = (u64, Option<Vec<u8>>);
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+/// A MemTable entry: (write_seq, expires_at, value_opt).
+/// - write_seq    : global monotonic counter, powers MVCC snapshots.
+/// - expires_at   : Unix-ms timestamp after which the entry is invisible.
+///                  0 means "never expires".
+/// - value_opt    : Some(bytes) = live key; None = tombstone.
+pub type MemEntry = (u64, u64, Option<Vec<u8>>);
 
 pub struct MemTable {
     data: BTreeMap<Vec<u8>, MemEntry>,
@@ -41,20 +48,23 @@ impl MemTable {
         Self { data: BTreeMap::new(), size_bytes: 0 }
     }
 
-    /// Insert or overwrite a key with an explicit write sequence number.
+    /// Insert or overwrite a key with explicit seq and optional TTL expiry (Unix ms, 0 = forever).
     pub fn put_seq(&mut self, key: Vec<u8>, value: Vec<u8>, seq: u64) {
-        self.size_bytes += key.len() + value.len() + 8;
-        self.data.insert(key, (seq, Some(value)));
+        self.put_seq_ttl(key, value, seq, 0);
+    }
+
+    pub fn put_seq_ttl(&mut self, key: Vec<u8>, value: Vec<u8>, seq: u64, expires_at: u64) {
+        self.size_bytes += key.len() + value.len() + 16;
+        self.data.insert(key, (seq, expires_at, Some(value)));
     }
 
     /// Insert a tombstone with an explicit write sequence number.
     pub fn delete_seq(&mut self, key: Vec<u8>, seq: u64) {
-        self.size_bytes += key.len() + 8;
-        self.data.insert(key, (seq, None));
+        self.size_bytes += key.len() + 16;
+        self.data.insert(key, (seq, 0, None));
     }
 
     /// Insert or overwrite using seq = u64::MAX (always visible to any snapshot).
-    /// Kept for internal paths that don't need MVCC tracking (WAL replay, compaction).
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
         self.put_seq(key, value, u64::MAX);
     }
@@ -64,18 +74,20 @@ impl MemTable {
         self.delete_seq(key, u64::MAX);
     }
 
-    /// Snapshot-aware point lookup: returns None if the entry's seq > max_seq.
-    /// This lets a Snapshot "time-travel" to see only writes up to a pinned seq.
+    /// Snapshot-aware point lookup: respects max_seq and TTL expiry.
     pub fn get_at(&self, key: &[u8], max_seq: u64) -> Option<&Option<Vec<u8>>> {
-        self.data.get(key).and_then(|(seq, val)| {
-            if *seq <= max_seq { Some(val) } else { None }
+        self.data.get(key).and_then(|(seq, expires_at, val)| {
+            if *seq > max_seq { return None; }
+            if *expires_at != 0 && now_ms() > *expires_at { return None; }
+            Some(val)
         })
     }
 
-    /// Latest-version lookup (seq-unaware). Returns the current value regardless
-    /// of sequence number. Used by the normal (non-snapshot) read path.
+    /// Latest-version lookup. Used by normal (non-snapshot) read path.
     pub fn get(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
-        self.data.get(key).map(|(_, v)| v)
+        self.data.get(key).and_then(|(_, expires_at, val)| {
+            if *expires_at != 0 && now_ms() > *expires_at { None } else { Some(val) }
+        })
     }
 
     /// Iterate entries in sorted key order (for flush to SSTable and for Cursor).

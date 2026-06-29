@@ -147,7 +147,7 @@ impl SSTable {
         let mut max_write_seq: u64 = 0;
         let mut builder = BlockBuilder::new();
 
-        for (key, (seq, val_opt)) in mem.iter() {
+        for (key, (seq, _expires, val_opt)) in mem.iter() {
             bloom.insert(key);
             builder.add(key, *seq, val_opt);
             if *seq > max_write_seq { max_write_seq = *seq; }
