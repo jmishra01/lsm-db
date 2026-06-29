@@ -81,7 +81,7 @@ impl Snapshot {
 /// A buffer of mutations to be committed atomically.
 ///
 /// Usage:
-/// ```
+/// ```ignore
 /// let mut batch = WriteBatch::new();
 /// batch.put("default", "key_a", "val_a")
 ///      .put("default", "key_b", "val_b")

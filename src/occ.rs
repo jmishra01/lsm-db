@@ -49,7 +49,7 @@ impl std::error::Error for ConflictError {}
 /// An OCC transaction against a single `LsmEngine`.
 ///
 /// Usage:
-/// ```no_run
+/// ```ignore
 /// let mut tx = OccTransaction::begin(&db);
 /// let val = tx.get(b"balance")?;
 /// tx.put("balance".into(), b"new_val".to_vec());

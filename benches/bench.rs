@@ -7,7 +7,7 @@
 // ------
 //   write_throughput   — sequential puts (1 B values, 8 B keys)
 //   write_batch        — WriteBatch of 100 entries each iteration
-//   read_random        — random-key get after 10 000 pre-loaded keys
+//   read_random        — random-key get after 10 000 preloaded keys
 //   read_sequential    — full scan (iter()) across 1 000 keys
 //   scan_prefix        — scan_prefix on a 100-key subset
 // =============================================================

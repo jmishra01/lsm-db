@@ -184,10 +184,10 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// Build and return the axum Router.  Caller binds it to a TcpListener.
 ///
 /// ```no_run
+/// use lsmdb::SharedLsmEngine;
 /// let db  = SharedLsmEngine::open("/tmp/mydb").unwrap();
 /// let app = lsmdb::http_api::make_router(db);
-/// let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-/// axum::serve(listener, app).await.unwrap();
+/// // bind and serve with tokio + axum
 /// ```
 pub fn make_router(db: SharedLsmEngine) -> Router {
     let state = AppState::new(db);
