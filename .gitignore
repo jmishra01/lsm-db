@@ -1,1 +1,6 @@
+# IDE
+.idea
+
+# RUST
+Cargo.lock
 /target
